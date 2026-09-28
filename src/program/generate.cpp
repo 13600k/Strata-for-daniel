@@ -47,6 +47,7 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -273,6 +274,9 @@ struct Options {
     int prompt_cache = 6;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
+    /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
+    /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
+    int64_t prompt_cache_root = 2048;
     /// --serve: the token that opens a chat turn (<|im_start|>).  The last one in a prompt is where the chat's
     /// history ends and the new assistant turn begins, which is the checkpoint the next request can reuse.
     int64_t turn_token = 248045;
@@ -639,6 +643,7 @@ struct ConvCheckpoint {
     std::vector<int32_t> ids;     ///< the tokens this state has consumed
     std::vector<ImgKey> imgs;     ///< the images among them
     std::vector<uint8_t> gdn, ple, tails;
+    uint64_t used = 0;            ///< last-use stamp for the retention policy (conv_cache.hpp)
 };
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -767,6 +772,38 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
     std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
                  o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
     return true;
+}
+
+// The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
+// reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
+// carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).
+double probe_pcie_h2d_gbps() {
+    constexpr size_t kBytes = 256ull << 20;
+    constexpr int kIters = 4;
+    void* h = nullptr;
+    void* d = nullptr;
+    cudaEvent_t ev0, ev1;
+    if (cudaMallocHost(&h, kBytes) != cudaSuccess) return -1.0;
+    if (cudaMalloc(&d, kBytes) != cudaSuccess || cudaEventCreate(&ev0) != cudaSuccess ||
+        cudaEventCreate(&ev1) != cudaSuccess) {
+        if (d != nullptr) cudaFree(d);
+        cudaFreeHost(h);
+        return -1.0;
+    }
+    std::memset(h, 0, kBytes);   // fault the pages in before timing
+    cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);   // warmup: context up, copy engine primed
+    cudaEventRecord(ev0);
+    for (int i = 0; i < kIters; ++i) cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
+    cudaEventRecord(ev1);
+    const bool ok = cudaEventSynchronize(ev1) == cudaSuccess;
+    float ms = 0.f;
+    const bool timed = ok && cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess && ms > 0.01f;
+    const double bw = timed ? ((double) kIters * (double) kBytes / (ms * 1e-3)) / 1e9 : -1.0;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    cudaFree(d);
+    cudaFreeHost(h);
+    return bw;
 }
 
 }  // namespace
@@ -915,6 +952,7 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+        else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -1169,8 +1207,25 @@ int main(int argc, char** argv) {
             }
         }
     }
-    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
-    if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
+    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
+    // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
+    // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
+    // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
+    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    if (o.pcie_frac < 0.0) {
+        const double base = native_pack ? 0.55 : 0.2;
+        const double bw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
+        if (!native_pack) {
+            o.pcie_frac = base;
+        } else if (bw > 0.0) {
+            o.pcie_frac = bw >= 20.0 ? base : std::min(base, std::max(0.05, base * (bw / 26.0)));
+            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device -> pcie_frac %.2f (default %.2f)\n",
+                         bw, o.pcie_frac, base);
+        } else {
+            o.pcie_frac = base;
+            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+        }
+    }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
@@ -2534,11 +2589,16 @@ int main(int argc, char** argv) {
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
-        // saved points; every one of them is a prefix of `live` (the loop drops the rest).
+        // saved points; every one of them is a prefix of `live` (the loop drops the rest), so they form a chain -
+        // the radix cache's tree collapsed onto the one branch of history whose cells the session holds.  The
+        // chain's root is the deepest point every request so far shared (the end of the system prompt, in
+        // practice); the retention policy pins it and rotates the rest LRU (conv_cache.hpp), so a NEW chat that
+        // shares that prefix mounts through it instead of reading it again.
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
+        uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         Clock::time_point pp_t0 = Clock::now();
@@ -2550,13 +2610,22 @@ int main(int argc, char** argv) {
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
         auto checkpoint_at = [&](int64_t L) -> bool {
             if (o.prompt_cache <= 0 || L < 1) return true;
-            for (const ConvCheckpoint& c : checks) if ((int64_t) c.ids.size() == L) return true;
+            for (ConvCheckpoint& c : checks)
+                if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+            c.used = ++check_clock;
             checks.push_back(std::move(c));
-            while ((int) checks.size() > o.prompt_cache) checks.erase(checks.begin());   // the oldest goes first
+            while ((int) checks.size() > o.prompt_cache) {
+                std::vector<uint64_t> stamps;
+                stamps.reserve(checks.size());
+                for (const ConvCheckpoint& k : checks) stamps.push_back(k.used);
+                const size_t victim = strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(),
+                                                                                   o.prompt_cache);
+                checks.erase(checks.begin() + (std::ptrdiff_t) victim);
+            }
             return true;
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
@@ -2988,8 +3057,9 @@ int main(int argc, char** argv) {
                 cudaStreamSynchronize(main_stream);
                 checks.clear();
             } else if (!from_live) {
-                const ConvCheckpoint* c = nullptr;
-                for (const ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
+                ConvCheckpoint* c = nullptr;
+                for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
+                if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
                 static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
                 if (reread && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
@@ -3139,8 +3209,20 @@ int main(int argc, char** argv) {
             if (o.prompt_cache > 0 && o.turn_token >= 0)
                 for (int64_t i = n - 1; i > resume; --i)
                     if (ids[(size_t) i] == o.turn_token) { turn_at = i; break; }
+            // A prompt read from token 0 also stops at its FIRST turn boundary: the end of the system prompt (with
+            // the tools), which every new chat of the same client shares.  That checkpoint becomes the chain's root,
+            // which the retention policy pins (conv_cache.hpp), so the next new chat reads only what comes after it.
+            // (PR #65, code-martin.)  Only for a system prompt of --prompt-cache-root tokens or more: a small one
+            // is cheaper to read again than the extra part costs (~0.3 s).
+            int64_t root_at = -1;
+            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && read_from == 0)
+                for (int64_t i = 1; i < turn_at; ++i)
+                    if (ids[(size_t) i] == o.turn_token) {
+                        if (i >= o.prompt_cache_root) root_at = i;
+                        break;
+                    }
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, turn_at, n - 1}) {
+            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
                 if (to <= at) continue;
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
@@ -3169,7 +3251,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if (to == turn_at && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
@@ -3201,6 +3283,8 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
+            const int64_t decode_hits0 = drive.d.cache_hits;
+            const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -3378,9 +3462,12 @@ int main(int argc, char** argv) {
                              (unsigned long long) h_pool, (unsigned long long) h_kv, (unsigned long long) h_mtp,
                              (unsigned long long) h_stale, ss.ple_prev[0], ss.ple_prev[1]);
             }
-            // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", (long long) produced_n, (long long) n, prompt_ms,
-                        decode_ms, finish, (long long) draft_accepted, (long long) draft_offered, (long long) resume);
+            const int64_t req_hits = drive.d.cache_hits - decode_hits0;
+            const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
+            // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n, prompt_ms,
+                        decode_ms, finish, (long long) draft_accepted, (long long) draft_offered, (long long) resume,
+                        (long long) req_hits, (long long) req_look);
             std::fflush(stdout);
             const int64_t fresh = n - resume;
             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %lld read in %.0f ms (%.1f tok/s), "
@@ -3389,6 +3476,13 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * fresh / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
+            // to read (--pcie-frac) are in neither count
+            if (req_look > 0) {
+                std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)\n",
+                             100.0 * (double) req_hits / (double) req_look,
+                             (long long) req_hits, (long long) req_look);
+            }
             if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 uint64_t miss = 0, look = 0;

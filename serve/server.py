@@ -180,6 +180,10 @@ class StrataEngine:
         loading.set()
         if self.max_context <= 0:
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
+        # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
+        if self.info.get("engine"):
+            self.info["version"] = str(self.info["engine"])
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
@@ -234,6 +238,8 @@ class StrataEngine:
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+        if len(f) >= 11:                                  # decode hit rate fields
+            self.last.update(hits=int(f[9]), lookups=int(f[10]))
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -774,6 +780,7 @@ class Service:
                     last = dict(getattr(self.engine, "last", {}) or {})
                     started = self.status.get("started", time.time())
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
+                    hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                     self.history.append({
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
@@ -781,7 +788,8 @@ class Service:
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                        if n and last.get("generated") and last.get("decode_ms") else None})
+                        if n and last.get("generated") and last.get("decode_ms") else None,
+                        "hit_rate": hit_rate})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -793,8 +801,9 @@ class Service:
                     el = now - self.status.get("started", now)
                     ft = self.status.get("first_token")
                     rate = n / max(1e-6, now - ft) if ft else 0.0
+                    hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                          f"({finish}, cancel={cancel.is_set()})", flush=True)
+                          f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False

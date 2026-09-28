@@ -7,7 +7,7 @@
 # CUDA kernels require compute capability >= 8.0. Local builds can target native;
 # redistributable builds should explicitly list their supported CUDA architectures.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.19 LANGUAGES CXX)
+project(strata VERSION 0.1.20 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
@@ -480,6 +480,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
   target_link_libraries(draft_policy_test PRIVATE strata_spec)
   add_test(NAME draft_policy_test COMMAND draft_policy_test)
+  # the serve loop's conversation-cache retention policy (header-only, no library to link)
+  add_executable(conv_cache_test src/program/conv_cache_test.cpp)
+  target_include_directories(conv_cache_test PRIVATE include)
+  add_test(NAME conv_cache_test COMMAND conv_cache_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

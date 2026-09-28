@@ -60,7 +60,7 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
-MIN_ENGINE = (0, 1, 19)                # v0.1.19: penalties on every drafted token; v0.1.17: one penalties stage (#53)
+MIN_ENGINE = (0, 1, 20)                # v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 
 MODELS = {
@@ -552,7 +552,18 @@ def get_llama_cpp():
         f.extractall(tmp)
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
-    top.replace(llama)
+    # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
+    # fresh unpack; shutil.move falls back to copy-and-delete, and a few retries let the scanner finish.  The target
+    # is `llama` itself - moving into its parent would keep the zip's `llama.cpp-<sha>` folder name.
+    for attempt in range(5):
+        try:
+            shutil.move(str(top), str(llama))
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            shutil.rmtree(llama, ignore_errors=True)   # a partial copy from the failed attempt
+            time.sleep(2)
     shutil.rmtree(tmp, ignore_errors=True)
     z.unlink(missing_ok=True)
     z.with_name(z.name + ".done").unlink(missing_ok=True)

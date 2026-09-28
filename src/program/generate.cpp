@@ -30,6 +30,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
@@ -54,6 +55,14 @@
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
 #endif
 #include "strata/artifact/gguf_reader.hpp"
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#include <cerrno>
+#endif
 
 #include <cuda_runtime.h>
 
@@ -216,6 +225,9 @@ struct Options {
     int vram_reserve_mib = 700;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
+    /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
+    /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
+    bool prefill_auto = false;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -366,7 +378,8 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native)\n"
+                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
+                 "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -496,6 +509,96 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+}
+
+// ---- issue #31: what the watchdog prints before it stops a stalled engine
+struct MemSample {
+    unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
+};
+MemSample mem_sample() {
+    MemSample m;
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) {
+        m.faults = pmc.PageFaultCount;
+        m.rss_mib = pmc.WorkingSetSize >> 20;
+        m.commit_mib = pmc.PagefileUsage >> 20;
+    }
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
+#else
+    if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
+        char buf[4096];
+        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+        buf[n] = 0;
+        std::fclose(f);
+        const char* s = std::strrchr(buf, ')');   // fields after the command name: 3 state ... 12 majflt
+        for (int field = 2; s && field < 12; ++field) s = std::strchr(s + 1, ' ');
+        if (s) m.faults = std::strtoull(s + 1, nullptr, 10);
+    }
+    auto kb = [](const char* path, const char* key) -> unsigned long long {
+        unsigned long long v = 0;
+        if (std::FILE* f = std::fopen(path, "r")) {
+            char line[256];
+            const size_t kl = std::strlen(key);
+            while (std::fgets(line, sizeof line, f))
+                if (std::strncmp(line, key, kl) == 0) { v = std::strtoull(line + kl, nullptr, 10); break; }
+            std::fclose(f);
+        }
+        return v;
+    };
+    m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
+    m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
+    m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
+#endif
+    return m;
+}
+
+void stall_report(std::FILE* f, uint64_t layers_during) {
+    strata::core::Progress& p = strata::core::progress();
+    std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s %lld\" for %lld s; %llu layers served since the "
+                    "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, p.where.load(),
+                 (long long) p.detail.load(), (long long) ((strata::core::progress_now_ms() - p.since_ms.load()) / 1000),
+                 (unsigned long long) layers_during);
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::fprintf(f, "  2 s later:\n");
+        }
+        if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
+        if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
+        const MemSample m = mem_sample();
+        std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
+                     m.commit_mib,
+#if defined(_WIN32)
+                     "committed", m.avail_mib, m.faults, "page faults so far"
+#else
+                     "in swap", m.avail_mib, m.faults, "major page faults so far"
+#endif
+        );
+        std::fflush(f);
+    }
+#if defined(_WIN32)
+    // every thread's stack, to read against this build's PDB: a few MB beside the engine's working directory
+    if (HMODULE dbg = LoadLibraryA("dbghelp.dll")) {
+        using Fn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+        if (auto write = (Fn) GetProcAddress(dbg, "MiniDumpWriteDump")) {
+            char path[64];
+            std::snprintf(path, sizeof path, "strata-stall-%lu.dmp", (unsigned long) GetCurrentProcessId());
+            HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                const int kThreadInfo = 0x1000;   // MiniDumpWithThreadInfo; MiniDumpNormal = 0
+                const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), h, kThreadInfo, nullptr, nullptr, nullptr);
+                CloseHandle(h);
+                char full[MAX_PATH];
+                if (!GetFullPathNameA(path, MAX_PATH, full, nullptr)) std::snprintf(full, sizeof full, "%s", path);
+                std::fprintf(f, "  %s the thread stacks to %s (attach it to the issue)\n", ok ? "wrote" : "could not write",
+                             full);
+            }
+        }
+    }
+#endif
 }
 
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
@@ -673,6 +776,16 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
+    // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
+    // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
+    if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("CUDA_MODULE_LOADING", "EAGER");
+#else
+        setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+#endif
+    }
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -778,7 +891,11 @@ int main(int argc, char** argv) {
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
-        else if (a == "--prefill") o.prefill_chunk = std::atoll(next("--prefill"));
+        else if (a == "--prefill") {
+            const std::string v = next("--prefill");
+            o.prefill_auto = v == "auto";
+            o.prefill_chunk = o.prefill_auto ? 8192 : std::atoll(v.c_str());
+        }
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
@@ -883,12 +1000,16 @@ int main(int argc, char** argv) {
     const int primary_device = devices.front();
     const bool multi_gpu = devices.size() > 1;
     if (multi_gpu && (o.spec < 2 || o.spec > strata::kernels::cpu::MAXT || o.native_preset.empty() ||
-        o.prefill_chunk <= 0 || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool ||
+        o.prefill_chunk <= 0 || o.expert_profile.empty() || o.no_pool ||
         o.no_capture || o.no_token_graph || o.expert_cache_per_layer || !o.dump_layers.empty() ||
         !o.dump_halves.empty() || o.graph_only || o.gpu_only_full || o.gpu_stages || o.stage_timing)) {
         std::fprintf(stderr, "multi-GPU experts need --native, --spec 2..8, --prefill, --expert-profile and "
                              "--expert-cache auto|N with the normal captured verification path\n");
         return 2;
+    }
+    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
+        o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
+        o.prefill_chunk = 2048;
     }
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
@@ -1042,7 +1163,7 @@ int main(int argc, char** argv) {
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type)) {
                 std::fprintf(stderr, "strata: layer %zu uses unsupported grouped expert types %d/%d. "
                                      "Dense 4-bit support does not imply expert support; use a validated "
-                                     "Q2_0/IQ2_XS/IQ3_XXS/IQ3_S pack. No weights were requantized.\n",
+                                     "Q2_0/IQ2_XS/IQ3_XXS/IQ3_S or Coder pack. No weights were requantized.\n",
                              l, f.gu_type, f.d_type);
                 return 2;
             }
@@ -1053,7 +1174,9 @@ int main(int argc, char** argv) {
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
-        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on AVX2\n");
+        std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
+                             "(multi-token for the i-quant gate/up rows)\n",
+                     std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
@@ -1155,8 +1278,26 @@ int main(int argc, char** argv) {
         strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
-    const strata::core::ModelGeometry g;
-    const int64_t K = 10;
+    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
+    int64_t K = 10;
+    if (!o.native_preset.empty()) {
+        // a pruned variant (GSQ-RCO Coder) ships fewer experts than the canonical 512x10; the model file
+        // is the authority on its own MoE shape - everything else in the geometry is unchanged
+        try {
+            strata::GgufFile model_gguf(o.native_preset);
+            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
+            if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
+                         o.native_preset.c_str(), e.what());
+            return 1;
+        }
+    }
+    if (multi_gpu && (K != 10 || g.n_expert != strata::kernels::cpu::expert_layout().n_expert)) {
+        std::fprintf(stderr, "strata multi-GPU: the model and pack must agree on the expert count, "
+                             "and the verification path currently requires top-10 routing\n");
+        return 2;
+    }
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
     if (!o.cvec_files.empty()) {
@@ -1368,7 +1509,10 @@ int main(int argc, char** argv) {
             o.mtp.clear();
         }
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        if (!o.mtp.empty() && !mtp.load(o.mtp, g, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
+        // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
+        static const strata::core::ModelGeometry draft_geometry{};
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
@@ -1384,16 +1528,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // The profile knows how many slots it was built for.  `--expert-cache 0` means "take the profile's";
-        // an explicit smaller number is allowed and simply truncates the ranked list, which is the right
-        // behaviour for asking "what would 2,000 slots give" without rebuilding the file.
-        if (o.expert_cache == 0) o.expert_cache = (int) pslots;
-        const size_t ranked_count = profile.size();
-        try { profile = strata::plan::complete_expert_ranking(profile, g.n_layers, g.n_expert); }
-        catch (const std::exception& e) { std::fprintf(stderr, "strata: %s\n", e.what()); return 2; }
-        std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, %zu candidates after completing "
-                             "the unranked tail (profile size is not a VRAM limit)\n",
-                     o.expert_profile.c_str(), ranked_count, profile.size());
+        // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
+        // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
+        // every pair (issue #46: a card that holds more than the old 8,000 used to stop there), so it means auto.
+        if (o.expert_cache == 0) o.expert_cache = -1;
+        std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
+                     o.expert_profile.c_str(), profile.size(), (long long) pslots);
     }
     // THE HEAD BEFORE THE CACHE.  The expert cache takes what is free minus the reserve, so everything allocated
     // after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after it and ate most of
@@ -1453,20 +1593,73 @@ int main(int argc, char** argv) {
         o.expert_cache = (int) sized_slots.size();
     }
     if (o.expert_cache > 0) {
+        // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
+        auto shrink_to = [&](int64_t keep_bytes) -> bool {
+            if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            if (!sized_slots.empty()) {
+                int64_t used = 0;
+                size_t keep = 0;
+                while (keep < sized_slots.size() && used + (sized_slots[keep] + 255) / 256 * 256 <= keep_bytes)
+                    used += (sized_slots[keep++] + 255) / 256 * 256;
+                sized_slots.resize(keep);
+                o.expert_cache = (int) keep;
+            } else {
+                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
+            }
+            if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            return true;
+        };
+        auto cache_bytes = [&]() -> int64_t {
+            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            int64_t b = 0;
+            for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
+            return b;
+        };
         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
         // allocation is not resident until it is touched, and the free figure read before it can be ~1 GB too
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
         // page back while the verify graph spun on a host flag never finished.  So the slots are zeroed and the
         // free figure read again; while it is short of the reserve the cache is reopened smaller.
+        // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
+        int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
+        int failed = 0;
         for (int attempt = 0;; ++attempt) {
-            const bool ok = sized_slots.empty()
-                ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
-                : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
+            bool ok = false;
+            if (fake_fails > 0) {
+                --fake_fails;
+                err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
+            } else {
+                ok = sized_slots.empty()
+                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
+                    : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
+            }
             if (!ok) {
+                // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
+                // so with a small page file the cache's one big cudaMalloc fails while the VRAM is free.  An auto
+                // cache then tries three quarters of the size, a few times, instead of stopping the engine.
+                char commit[96] = "";
+#if defined(_WIN32)
+                MEMORYSTATUSEX ms{};
+                ms.dwLength = sizeof ms;
+                if (GlobalMemoryStatusEx(&ms))
+                    std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
+                                  (double) ms.ullAvailPageFile / 1073741824.0);
+#endif
+                if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
+                    ++failed;
+                    std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
+                                 commit, o.expert_cache);
+                    continue;
+                }
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+#if defined(_WIN32)
+                std::fprintf(stderr, "strata generate: on Windows the graphics card's memory also needs room in the page "
+                                     "file: set it to \"System managed\" (System > About > Advanced system settings > "
+                                     "Performance > Advanced > Virtual memory), or lower --expert-cache\n");
+#endif
                 return 1;
             }
-            if (!auto_cache || attempt >= 6) break;
+            if (!auto_cache || attempt - failed >= 6) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
@@ -1480,19 +1673,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB); "
                                  "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
             xcache.close();
-            if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); break; }
-            if (!sized_slots.empty()) {
-                int64_t used = 0;
-                size_t keep = 0;
-                while (keep < sized_slots.size() && used + (sized_slots[keep] + 255) / 256 * 256 <= keep_bytes)
-                    used += (sized_slots[keep++] + 255) / 256 * 256;
-                sized_slots.resize(keep);
-                o.expert_cache = (int) keep;
-            } else {
-                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
-            }
-            if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); break; }
+            if (!shrink_to(keep_bytes)) break;
         }
+        if (failed > 0 && o.expert_cache > 0)
+            std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
+                                 "page file lets it use more of the free VRAM\n",
+                         o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
@@ -1725,7 +1911,7 @@ int main(int argc, char** argv) {
     }
 
     mem_mark("the expert cache and the graphs");
-    std::fprintf(stderr, "strata generate: session is up\n");
+    std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
             return strata::core::lm_head(wt, g, ss.block, d_logits, stream, err);
@@ -1776,6 +1962,16 @@ int main(int argc, char** argv) {
     sp.top_k = o.top_k;
     sp.top_p = o.top_p;
     sp.temperature = o.temperature;
+    // what this run actually samples with (the speculative loop below gets the same parameters); serve samples
+    // per request instead
+    if (!o.serve) {
+        if (sp.greedy || sp.temperature <= 0.0f)
+            std::fprintf(stderr, "strata generate: sampling greedy\n");
+        else
+            std::fprintf(stderr, "strata generate: sampling temperature=%g top_k=%d top_p=%g seed=%llu\n",
+                         (double) sp.temperature, sp.top_k > 0 && sp.top_k < 64 ? sp.top_k : 64, (double) sp.top_p,
+                         (unsigned long long) sp.seed);
+    }
 
     std::FILE* dump = nullptr;
     const int64_t dump_positions = (int64_t) o.tokens.size() - 1 + o.max_new;
@@ -2203,38 +2399,97 @@ int main(int argc, char** argv) {
     // from the live session or the longest conversation checkpoint its prompt starts with (see ConvCheckpoint),
     // otherwise from an empty sequence (`session_zero`); the rest of the prompt goes through the batched prompt path
     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
+    // The expert-cache slots (from the end of the cache) that hold the prompt path's buffers for a chunk, and the
+    // bytes from the first of them to the end.
+    // the share of expert bytes the arena could pin (sizes the prompt path's streamed ring and its lend cap)
+    if (srcp != nullptr && o.prefill_chunk > 0) {
+        uint64_t pinned = 0, total = 0;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const uint64_t b = lay.blob_bytes(l);
+                total += b;
+                if (srcp->pinned(l, e)) pinned += b;
+            }
+        strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
+    }
+    auto lend_slots = [&](int64_t c) -> int64_t {
+        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
+            k = 0;
+            while (k < xcache.slots() &&
+                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+        }
+        return k;
+    };
+    auto lend_bytes = [&](int32_t first) -> uint64_t {
+        return xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
+                                     : (uint64_t) (xcache.slots() - first) *
+                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+    };
+    // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
+    // or with --prefill auto the largest of kAutoChunks whose buffers take at most kAutoLendPct % of the slots (a
+    // lent slot's expert is streamed during the prompt and refilled after it; measured on a 12 GB card, 32K Q2_0
+    // prompt: 4096 791 tok/s, 6144 878, 8192 973 with 69% of the slots lent).  A request lends only what its own
+    // prompt needs (Prefill::relayout), so a big chunk costs short prompts nothing.  0 = none fits.
+    auto plan_lend = [&](int64_t& chunk) -> int64_t {
+        static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+        // at 8192-token chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the
+        // copies are DMA from pinned RAM (Q2_0 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the
+        // limit (lending more only streams more through them).  STRATA_PREFILL_LEND_PCT overrides (tuning).
+        const int64_t kAutoLendPct = [] {
+            const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+            return v ? (int64_t) std::atoi(v)
+                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+        }();
+        auto slots_for = lend_slots;
+        if (o.prefill_auto) {
+            for (const int64_t c : kAutoChunks) {
+                const int64_t k = slots_for(c);
+                if (k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) { chunk = c; return k; }
+            }
+            return 0;
+        }
+        for (int64_t c = chunk; c >= 256; c /= 2) {
+            const int64_t k = slots_for(c);
+            if (k + 128 <= xcache.slots()) { chunk = c; return k; }
+        }
+        return 0;
+    };
     if (o.serve) {
-        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 || thits.d_res == nullptr || host_res.empty()) {
-            std::fprintf(stderr, "strata serve: needs --spec T, --mtp DIR, --prefill CHUNK, --expert-profile P and "
-                                 "--expert-cache\n");
+        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
+            (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
+            std::fprintf(stderr, "strata serve: needs --spec T, --mtp DIR and --prefill CHUNK (and a fillable "
+                                 "--expert-cache; the graphed hit path additionally needs --expert-profile P)\n");
             return 2;
         }
         strata::prefill::Prefill sp;
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
-        int32_t lend_first = -1;
+        int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
+        int32_t lend_first_now = -1;      // where its buffers are laid out now
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card the
         // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
         // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
-        for (int64_t chunk = o.prefill_chunk; !o.no_prefill_borrow && d_res != nullptr && chunk >= 256; chunk /= 2) {
-            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, chunk);
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-            if (xcache.slot_offsets() != nullptr) {
-                k = 0;
-                while (k < xcache.slots() &&
-                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
-            }
-            if (k + 128 <= xcache.slots()) {
-                if (chunk != o.prefill_chunk)
+        if (!o.no_prefill_borrow && d_res != nullptr) {
+            int64_t chunk = o.prefill_chunk;
+            if (const int64_t k = plan_lend(chunk); k > 0) {
+                if (o.prefill_auto)
+                    std::fprintf(stderr, "strata serve: prompt chunk auto: %lld tokens\n", (long long) chunk);
+                else if (chunk != o.prefill_chunk)
                     std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in the "
                                          "expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
                 lend_first = (int32_t) (xcache.slots() - k);
+                lend_first_now = lend_first;
                 borrow = xcache.device_slot(lend_first);
-                borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[lend_first])
-                                                     : (uint64_t) k * (uint64_t) blob;
-                break;
+                borrow_bytes = xcache.slot_offsets()
+                                   ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[lend_first])
+                                   : (uint64_t) k * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+            } else if (o.prefill_auto) {
+                o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             }
         }
         if (borrow != nullptr)
@@ -2247,13 +2502,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the head and the prompt path");
-        // the penalty-history buffer: ONE row, the request's last `penalty_last_n` tokens, -1 padded in
-        // front.  Allocated once at the cap; a request without penalties gets a null row and takes the
-        // byte-for-byte neutral path (no upload, no buffer handed to the sampler).
+        // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
+        // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
+        // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
+        // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
+        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
         int32_t* d_hist = nullptr;
-        std::vector<int32_t> hist_stage((size_t) kPenaltyWindowCap, -1);
-        if (cudaMalloc(&d_hist, (size_t) kPenaltyWindowCap * sizeof(int32_t)) != cudaSuccess) {
+        std::vector<int32_t> hist_stage(kHistSlots, -1);
+        if (cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
@@ -2269,8 +2526,11 @@ int main(int argc, char** argv) {
         }
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
-                          : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
+        // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
+        // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
+        // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
+        // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
+        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
@@ -2397,8 +2657,35 @@ int main(int argc, char** argv) {
         std::deque<std::string> in_lines;
         bool in_eof = false;
         std::thread([&] {
-            std::string l;
-            while (std::getline(std::cin, l)) {
+            // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
+            // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
+            // std::exit) would hang in exit() on Linux, and the server would wait for it forever
+            std::string l, buf;
+            char chunk[4096];
+            auto getline_fd = [&](std::string& out) -> bool {
+                for (;;) {
+                    const size_t nlpos = buf.find('\n');
+                    if (nlpos != std::string::npos) {
+                        out.assign(buf, 0, nlpos);
+                        buf.erase(0, nlpos + 1);
+                        return true;
+                    }
+#if defined(_WIN32)
+                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
+                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    if (n < 0 && errno == EINTR) continue;
+#endif
+                    if (n <= 0) {
+                        if (buf.empty()) return false;
+                        out.swap(buf);
+                        buf.clear();
+                        return true;
+                    }
+                    buf.append(chunk, (size_t) n);
+                }
+            };
+            while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
@@ -2446,34 +2733,38 @@ int main(int argc, char** argv) {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
-                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s devices=%s gpu_uuids=%s arena_mib=%lld\n",
+                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s devices=%s gpu_uuids=%s arena_mib=%lld "
+                        "pool_workers=%d pcie_frac=%.2f spec_min_p=%.2f engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(), o.devices.c_str(), device_uuids.c_str(),
-                        (long long) (strata::kernels::cpu::expert_layout().total >> 20));
+                        (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
+                        o.spec_min_p);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
-        // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.
+        // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
+        // part was doing (stall_report), so one occurrence says where the wait is.
         {
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
-            const int limit = ws ? std::atoi(ws) : 120;
+            const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
             if (limit > 0)
                 std::thread([limit] {
                     strata::core::Progress& p = strata::core::progress();
-                    uint64_t last = p.beats.load();
+                    uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                     auto since = std::chrono::steady_clock::now();
                     for (;;) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; since = now; continue; }
+                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
                         if (now - since < std::chrono::seconds(limit)) continue;
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s %lld) - stopping "
                                              "the engine so the server starts it again (issue #29)\n",
                                      limit, p.where.load(), (long long) p.detail.load());
+                        stall_report(stderr, p.ticks.load() - ticks_at);
                         std::fflush(stderr);
                         std::abort();
                     }
@@ -2520,6 +2811,9 @@ int main(int argc, char** argv) {
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
+            // the missed experts and the draft-probability floor, for this request only
+            double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
             if (endp != nullptr) {   // GENI takes only cvec=; its file path is the first token without an =
                 for (;;) {
                     while (*endp == ' ') ++endp;
@@ -2542,6 +2836,8 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -2741,6 +3037,12 @@ int main(int argc, char** argv) {
             };
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
+                struct NoHeadSampling {
+                    strata::core::Verifier& v;
+                    explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+                    ~NoHeadSampling() { v.set_head_sampling(true); }
+                } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
@@ -2769,15 +3071,7 @@ int main(int argc, char** argv) {
             // the batched path's slots are lent just before its first run and given back (refilled) before a window
             // reads - so the windows always see the whole expert cache - or once the prompt is read
             std::vector<std::pair<int32_t, int32_t>> lent_now;
-            auto lend = [&] {
-                if (lend_first < 0 || !lent_now.empty()) return;
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= lend_first) {
-                        lent_now.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
-                    }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-            };
+            int64_t lent_chunk = 0;   // the chunk the lent slots hold the prompt path's buffers for
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
@@ -2790,6 +3084,30 @@ int main(int argc, char** argv) {
                 }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 lent_now.clear();
+                lent_chunk = 0;
+                return true;
+            };
+            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+            // rounded up to 256), laid out in the last of the slots it may borrow
+            auto lend = [&](int64_t tokens, std::string& e) -> bool {
+                if (lend_first < 0) return true;                       // its own buffers: nothing to lend
+                const int64_t want = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
+                if (!lent_now.empty()) {
+                    if (want <= lent_chunk) return true;
+                    if (!refill(e)) return false;
+                }
+                const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
+                if (want != sp.chunk() || first != lend_first_now) {
+                    if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
+                    lend_first_now = first;
+                }
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= first) {
+                        lent_now.emplace_back((int32_t) i, host_res[i]);
+                        host_res[i] = strata::core::kNotResident;
+                    }
+                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                lent_chunk = want;
                 return true;
             };
             if (!apply_pending(true)) { std::printf("ERR %s\n", err.c_str()); return 1; }
@@ -2808,6 +3126,7 @@ int main(int argc, char** argv) {
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
+            drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
@@ -2828,7 +3147,10 @@ int main(int argc, char** argv) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
-                if (!win) lend();
+                if (!win && !lend(to - at, err)) {
+                    std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                    return 1;
+                }
                 const auto tsp = Clock::now();
                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
                 if (trace) {
@@ -2882,9 +3204,9 @@ int main(int argc, char** argv) {
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
-                if (o.spec_min_p > 0.0) {
+                if (req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -2909,17 +3231,14 @@ int main(int argc, char** argv) {
                 drive.d.failed = false;
                 if (!apply_pending(false)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (hist_n > 0) {
-                    // the tail the penalties count over: the tokens the state has consumed plus the fed-back
-                    // head `x` (it joins `consumed` only after this window commits).  Most recent LAST,
-                    // -1 in the unused front slots - the sampler's row layout.
-                    const int64_t avail = (int64_t) consumed.size() + 1;
-                    const int take = (int) std::min<int64_t>(hist_n, avail);
-                    std::fill(hist_stage.begin(), hist_stage.begin() + hist_n, -1);
-                    for (int j = 0; j < take - 1; ++j)
-                        hist_stage[(size_t) (hist_n - take + j)] =
-                            consumed[(size_t) ((int64_t) consumed.size() - (take - 1) + j)];
-                    hist_stage[(size_t) (hist_n - 1)] = (int32_t) x;
-                    cudaMemcpy(d_hist, hist_stage.data(), (size_t) hist_n * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
+                    // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
+                    // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
+                    // was staged, and the drafted rows read unwritten slots.)
+                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
+                                                  hist_n, hist_stage.data());
+                    cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
+                               cudaMemcpyHostToDevice);
                 }
                 tr("window", p, T);
                 if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
@@ -2954,7 +3273,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++rounds;
                 const bool drafted = eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed: %s\n", adapt_error.c_str());
@@ -3103,15 +3422,21 @@ int main(int argc, char** argv) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
-            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk);
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-            if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
-                k = 0;
-                while (k < xcache.slots() &&
-                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+            int64_t chunk = o.prefill_chunk;
+            int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
+            if (k > 0 && chunk > (n_prompt - 1 + 255) / 256 * 256) {   // no bigger than the prompt needs
+                chunk = std::max<int64_t>(256, (n_prompt - 1 + 255) / 256 * 256);
+                k = lend_slots(chunk);
+                if (!o.prefill_auto) o.prefill_chunk = chunk;
             }
-            if (k + 128 <= xcache.slots()) {   // the lent slots are refilled after the prompt
+            if (o.prefill_auto) {
+                o.prefill_chunk = k > 0 ? chunk : 1024;
+                std::fprintf(stderr, "strata generate: prompt chunk auto: %lld tokens\n", (long long) o.prefill_chunk);
+            } else if (chunk != o.prefill_chunk) {
+                k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
+            }
+            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
@@ -3338,8 +3663,9 @@ int main(int argc, char** argv) {
         }
 
         int next = 0;
-        // Teacher-forced prompt rows consume no generation draws.
-        sp.counter = (uint64_t) produced.size();
+        // The draw is Philox(seed, position), as in a verify window (row t at pos0 draws pos0 + t): a seed gives
+        // the same text whether a token comes from this path or from the speculative loop below.
+        sp.counter = (uint64_t) pos;
         strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
         if (cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost,
                             (cudaStream_t) token_stream) != cudaSuccess ||
@@ -3435,9 +3761,13 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the verifier and the drafter's binding");
+        ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         ver.set_split(o.spec_split);
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
-                          : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
+        // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
+        // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
+        // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
+        // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
+        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

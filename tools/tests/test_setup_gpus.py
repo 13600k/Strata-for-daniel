@@ -127,9 +127,15 @@ class DetectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be matched"):
             self.detect(["GPU-44444444-4444-4444-4444-444444444444"])
 
-    def test_legacy_gpu_info_returns_first_visible(self):
-        with patch.object(setup, "gpu_infos", return_value=[gpu(2)]):
-            self.assertEqual(setup.gpu_info(), gpu(2))
+    def test_single_gpu_uses_upstream_most_vram_or_physical_pick_without_cuda_probe(self):
+        found = [gpu(0), gpu(1, "120", 32), gpu(2)]
+        with patch.object(setup, "gpus", return_value=found), patch.object(setup, "GPU_PICK", None), \
+                patch.object(setup, "cuda_visible_uuids") as probe:
+            self.assertEqual(setup.gpu_info(), dict(found[1], count=3))
+            self.assertEqual(setup.gpu_info(2), dict(found[2], count=3))
+            with patch.object(setup, "say"), self.assertRaises(SystemExit):
+                setup.gpu_info(99)
+        probe.assert_not_called()
 
     def test_runtime_probe_uses_fresh_inheriting_subprocess(self):
         os.environ.update(CUDA_VISIBLE_DEVICES=f"{U2},{U0}", CUDA_DEVICE_ORDER="PCI_BUS_ID")
@@ -152,7 +158,25 @@ class DetectionTests(unittest.TestCase):
                 setup.cuda_visible_uuids()
 
 
-class ArgumentAndContextTests(unittest.TestCase):
+class SetupSandbox(unittest.TestCase):
+    """Every setup invocation, migration and settings write stays inside a temporary install tree."""
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.temp = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.root = self.temp / "installs" / "Strata"
+        self.root.mkdir(parents=True)
+        (self.root / "CMakeLists.txt").write_text("project(strata VERSION 0.1.19 LANGUAGES CXX)\n")
+        self.settings = self.temp / "settings" / "settings.json"
+        self.stack.enter_context(patch.object(setup, "ROOT", self.root))
+        self.stack.enter_context(patch.object(setup, "settings_path", return_value=self.settings))
+        self.stack.enter_context(patch.object(setup, "say"))
+        self.stack.enter_context(patch.object(setup, "GPU_PICK", None))
+        self.stack.enter_context(patch.object(setup, "is_wsl", return_value=False))
+        self.stack.enter_context(patch.object(sys, "path", sys.path.copy()))
+
+
+class ArgumentAndContextTests(SetupSandbox):
     def test_default_gpu_options_are_not_forwarded_implicitly(self):
         args = setup.argument_parser().parse_args([])
         self.assertIsNone(args.devices)
@@ -202,31 +226,29 @@ class ArgumentAndContextTests(unittest.TestCase):
                     patch.object(setup, "say"), patch.object(setup, "update_installed_engine") as update:
                 self.assertEqual(setup.main(args), 7)
                 update.assert_called_once()
-                start.assert_called_once_with(Path("saved.json"), port)
+                start.assert_called_once_with(Path("saved.json"), port, None)
                 detect.assert_not_called()
 
     def test_explicit_choices_do_not_launch_old_config(self):
         choices = (["--devices", "0"], ["--expert-vram-mib", "0"], ["--expert-reserve-mib", "1024"],
                    ["--context", "262144"], ["--allow-high-context"], ["--vision", "no"], ["--build"],
-                   ["--prebuilt", "local"], ["--models-dir", "models"], ["--gguf-dir", "ggufs"],
+                   ["--models-dir", "models"], ["--gguf-dir", "ggufs"],
                    ["--model", "IQ3_XXS"], ["--family", "swift"], ["--setup"], ["--check"], ["--no-start"],
                    ["--kv", "q4_0"], ["--kv-resident", "0"], ["--host", "0.0.0.0"], ["--api-key", "test"],
                    ["--experimental-speed-projection", "off"])
         for args in choices:
             with self.subTest(args=args), patch.object(setup, "installed_configs", return_value=[Path("saved.json")]), \
                     patch.object(setup, "start") as start, patch.object(setup, "gpu_infos", side_effect=RuntimeError("setup")), \
+                    patch.object(setup, "gpu_info", side_effect=RuntimeError("setup")), \
+                    patch.object(setup, "choices_from_config", return_value={}), \
                     patch.object(setup, "say"), self.assertRaisesRegex(RuntimeError, "setup"):
                 setup.main(args)
             start.assert_not_called()
 
 
-class BuildTests(unittest.TestCase):
+class BuildTests(SetupSandbox):
     def setUp(self):
-        self.stack = ExitStack()
-        self.addCleanup(self.stack.close)
-        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
-        self.stack.enter_context(patch.object(setup, "ROOT", self.root))
-        self.stack.enter_context(patch.object(setup, "say"))
+        super().setUp()
         self.tools = self.stack.enter_context(patch.object(setup, "install_build_tools", return_value=("/cuda/bin/nvcc", None)))
         self.build = self.stack.enter_context(patch.object(setup, "cmake_build"))
         self.stack.enter_context(patch.object(setup.shutil, "copy2"))
@@ -250,10 +272,11 @@ class BuildTests(unittest.TestCase):
         meta = json.loads((self.root / "engine" / "BUILD.json").read_text())
         self.assertEqual(meta["archs"], [86, 120])
 
-    def test_multigpu_rebuilds_even_with_matching_local_stamp(self):
+    def test_multigpu_reuses_matching_fingerprinted_local_build(self):
         self.stamp()
         setup.build_engine(gpu(0), "none", True, self.root / "llama", gpus=[gpu(0), gpu(2)])
-        self.build.assert_called_once()
+        self.build.assert_not_called()
+        self.tools.assert_not_called()
 
     def test_explicit_force_rebuilds_single_gpu(self):
         self.stamp()
@@ -269,7 +292,7 @@ class BuildTests(unittest.TestCase):
     def test_new_gpu_architecture_rebuilds_stale_local_engine(self):
         self.stamp()
         setup.build_engine(gpu(1, "120"), "none", True, self.root / "llama")
-        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=120", self.build.call_args.args[3])
+        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=86;120", self.build.call_args.args[3])
 
     def test_cpu_to_gpu_vision_rebuilds_encoder(self):
         self.stamp(vision="cpu")
@@ -341,7 +364,7 @@ class CmakeInvocationTests(unittest.TestCase):
                 definition = "-DCMAKE_CUDA_ARCHITECTURES=86;120"
                 with patch.object(setup, "ROOT", root), patch.object(setup, "WIN", windows), \
                         patch.object(setup, "find_tool", side_effect=lambda name: f"/Build Tools/{name}"), \
-                        patch.object(setup, "run") as run:
+                        patch.object(setup, "run", return_value=Mock(returncode=0)) as run:
                     setup.cmake_build(root, root / "build-setup", "strata", [definition], "vcvars64.bat", "build-strata.bat")
                 if windows:
                     self.assertEqual(run.call_args.args[0][:2], ["cmd", "/c"])
@@ -353,13 +376,10 @@ class CmakeInvocationTests(unittest.TestCase):
                     self.assertEqual(run.call_count, 2)
 
 
-class SetupConfigTests(unittest.TestCase):
+class SetupConfigTests(SetupSandbox):
     def setUp(self):
-        self.stack = ExitStack()
-        self.addCleanup(self.stack.close)
-        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
-        self.stack.enter_context(patch.object(setup, "ROOT", self.root))
-        self.stack.enter_context(patch.object(setup, "say"))
+        super().setUp()
+        self.stack.enter_context(patch.object(setup, "gpus", return_value=[gpu(0), gpu(1, "120", 32), gpu(2)]))
         self.stack.enter_context(patch.object(setup, "gpu_infos", return_value=[gpu(0), gpu(1, "120", 32), gpu(2)]))
         self.stack.enter_context(patch.object(setup, "ram_gb", return_value=64))
         self.stack.enter_context(patch.object(setup, "cpu_info", return_value=("Test CPU", True, False)))
@@ -403,8 +423,12 @@ class SetupConfigTests(unittest.TestCase):
             self.assertEqual(cfg["args"][cfg["args"].index(name) + 1], value)
         self.assertIn("--native", cfg["args"])
         self.assertEqual(cfg["vision"]["gpu_uuid"], U2)
+        self.assertNotIn("gpu", cfg)
+        self.assertEqual(cfg["args"][cfg["args"].index("--prefill") + 1], "auto")
+        self.assertEqual(cfg["args"][cfg["args"].index("--expert-profile") + 1],
+                         str(self.root / "data" / "expert-profile.bin"))
         self.prebuilt.assert_not_called()
-        self.assertTrue(self.build.call_args.kwargs["force"])
+        self.assertFalse(self.build.call_args.kwargs["force"])
         self.assertEqual([g["device"] for g in self.build.call_args.kwargs["gpus"]], [2, 1, 0])
 
     def test_single_gpu_default_keeps_prebuilt_path_and_old_engine_cli(self):
@@ -412,7 +436,8 @@ class SetupConfigTests(unittest.TestCase):
         for name in ("--devices", "--expert-vram-mib", "--expert-reserve-mib"):
             self.assertNotIn(name, cfg["args"])
         self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "131072")
-        self.assertEqual(cfg["vision"]["gpu_uuid"], U0)
+        self.assertNotIn("gpu_uuid", cfg["vision"])
+        self.assertEqual(cfg["gpu"], 1)  # upstream default: most VRAM, physical nvidia-smi index
         self.prebuilt.assert_called_once()
         self.build.assert_not_called()
 
@@ -424,7 +449,7 @@ class SetupConfigTests(unittest.TestCase):
                 cfg = self.configure(*args)
                 self.assertEqual(cfg["args"][cfg["args"].index(args[0]) + 1], args[1])
                 self.prebuilt.assert_not_called()
-                self.assertTrue(self.build.call_args.kwargs["force"])
+                self.assertFalse(self.build.call_args.kwargs["force"])
 
     def test_multigpu_defaults_keep_kv_on_primary_and_projection_off(self):
         cfg = self.configure("--devices", "0,1")
@@ -452,6 +477,27 @@ class SetupConfigTests(unittest.TestCase):
         self.assertNotIn("--kv-resident", cfg["args"])
         self.assertNotIn("--control-vector-scaled", cfg["args"])
 
+    def test_upstream_coder_family_keeps_its_pruned_profile_with_multigpu(self):
+        family = setup.FAMILIES["coder"]
+        for i in (1, 2):
+            (self.ggufs / family["file"].format(q="IQ1_M", i=i)).touch()
+        code = setup.main(["--family", "coder", "--model", "IQ1_M", "--context", "65536",
+                           "--devices", "0,1", "--vision", "no", "--gguf-dir", str(self.ggufs),
+                           "--no-start", "--yes"])
+        self.assertEqual(code, 0)
+        cfg = json.loads((self.root / f"strata-{family['tag']}iq1_m.json").read_text())
+        self.assertEqual(cfg["args"][cfg["args"].index("--expert-profile") + 1],
+                         str(self.root / "data" / "expert-profile-coder.bin"))
+        self.assertEqual(cfg["args"][cfg["args"].index("--prefill") + 1], "auto")
+        self.assertNotIn("gpu", cfg)
+        self.assertIn("--devices", cfg["args"])
+
+    def test_wsl_new_multigpu_config_obeys_upstream_no_streaming_rule(self):
+        with patch.object(setup, "is_wsl", return_value=True):
+            cfg = self.configure("--devices", "0,1", "--kv-resident", "32768")
+        self.assertNotIn("--kv-resident", cfg["args"])
+        self.assertIn("--devices", cfg["args"])
+
     def test_upstream_host_and_api_key_survive_explicit_reconfiguration(self):
         cfg = self.configure("--devices", "1,0", "--host", "0.0.0.0", "--api-key", "test-secret")
         self.assertEqual(cfg["host"], "0.0.0.0")
@@ -461,6 +507,108 @@ class SetupConfigTests(unittest.TestCase):
         cfg = self.configure("--devices", "1,0", "--vision", "cpu")
         self.assertNotIn("gpu_uuid", cfg["vision"])
         self.assertFalse(cfg["vision"]["gpu"])
+
+
+class MigrationAndSelectionTests(SetupSandbox):
+    def config(self):
+        exe = self.root / "engine" / setup.EXE
+        exe.parent.mkdir(exist_ok=True)
+        exe.touch()
+        (exe.parent / "BUILD.json").write_text('{"version": "0.1.19", "source": "local"}')
+        model = self.root / "models" / "fixture.gguf"
+        model.parent.mkdir(exist_ok=True)
+        model.write_bytes(b"fixture")
+        return {"exe": str(exe), "args": ["--native", str(model), "--prefill", "2048",
+                "--max-context", "262144", "--devices", "1,0", "--expert-vram-mib", "4096",
+                "--expert-reserve-mib", "2048", "--kv-resident", "0"],
+                "vision": {"gpu": True, "gpu_uuid": U1}, "port": 9090,
+                "allow_high_context": True, "mcp_servers": {"fixture": {"command": "example"}}}
+
+    def save_config(self, cfg):
+        path = self.root / "strata-iq3_xxs.json"
+        path.write_text(json.dumps(cfg))
+        return path
+
+    def test_physical_and_visible_selection_are_mutually_exclusive(self):
+        with patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit):
+            setup.argument_parser().parse_args(["--gpu", "1", "--devices", "0,1"])
+
+    def test_upstream_upgrade_keeps_devices_caps_and_mcp_but_drops_stale_mask(self):
+        cfg = self.config()
+        cfg["gpu"] = 2
+        path = self.save_config(cfg)
+        upgraded = setup.upgrade_config(path, cfg)
+        self.assertNotIn("gpu", upgraded)
+        self.assertEqual(upgraded["args"][upgraded["args"].index("--devices") + 1], "1,0")
+        self.assertEqual(upgraded["args"][upgraded["args"].index("--prefill") + 1], "auto")
+        self.assertEqual(upgraded["vision"]["gpu_uuid"], U1)
+        self.assertEqual(upgraded["mcp_servers"], cfg["mcp_servers"])
+        self.assertEqual(json.loads(path.read_text()), upgraded)
+
+    def test_old_binary_falls_back_to_fixed_prefill_without_losing_devices(self):
+        cfg = self.config()
+        cfg["args"][cfg["args"].index("--prefill") + 1] = "auto"
+        path = self.save_config(cfg)
+        with patch.object(setup, "engine_version", return_value=(0, 1, 12)):
+            upgraded = setup.upgrade_config(path, cfg)
+        self.assertEqual(upgraded["args"][upgraded["args"].index("--prefill") + 1], "2048")
+        self.assertIn("--devices", upgraded["args"])
+
+    def test_wsl_override_cannot_reenable_kv_streaming_in_saved_config(self):
+        cfg = self.config()
+        cfg["args"][cfg["args"].index("--kv-resident") + 1] = "32768"
+        path = self.save_config(cfg)
+        with patch.object(setup, "is_wsl", return_value=True):
+            setup.upgrade_config(path, cfg)
+        self.assertNotIn("--kv-resident", cfg["args"])
+        self.assertIn("--devices", cfg["args"])
+
+    def test_upstream_data_migration_preserves_multigpu_and_mcp_settings(self):
+        cfg = self.config()
+        old_model = Path(cfg["args"][1])
+        path = self.save_config(cfg)
+        dest, _ = setup.data_folder(str(self.temp / "shared-data"))
+        moved = json.loads(path.read_text())
+        self.assertFalse(old_model.exists())
+        self.assertEqual(Path(moved["args"][1]), dest / "models" / "fixture.gguf")
+        self.assertEqual(Path(moved["args"][1]).read_bytes(), b"fixture")
+        self.assertEqual(moved["args"][moved["args"].index("--devices") + 1], "1,0")
+        self.assertEqual(moved["mcp_servers"], cfg["mcp_servers"])
+        self.assertEqual(moved["vision"], cfg["vision"])
+        self.assertEqual(setup.load_settings()["data_dir"], str(dest))
+
+    def test_new_copy_inherits_devices_and_explicit_physical_choice_wins(self):
+        choices = setup.choices_from_config(self.save_config(self.config()))
+        inherited = setup.argument_parser().parse_args([])
+        setup.inherit_gpu_choices(inherited, choices)
+        self.assertEqual(inherited.devices, "1,0")
+        self.assertIsNone(inherited.gpu)
+        self.assertEqual(inherited.expert_vram_mib, 4096)
+        self.assertEqual(inherited.kv_resident, 0)
+        self.assertTrue(inherited.allow_high_context)
+        physical = setup.argument_parser().parse_args(["--gpu", "2"])
+        setup.inherit_gpu_choices(physical, choices)
+        self.assertEqual(physical.gpu, 2)
+        self.assertIsNone(physical.devices)
+
+    def test_single_gpu_override_cannot_silently_hide_saved_secondary_devices(self):
+        path = self.save_config(self.config())
+        with patch.object(setup.subprocess, "call") as call, patch.object(sys, "stderr", io.StringIO()), \
+                self.assertRaises(SystemExit):
+            setup.start(path, None, gpu=0)
+        call.assert_not_called()
+
+    def test_calibration_keys_distinguish_device_order_and_cache_budget(self):
+        cfg = self.config()
+        with patch.object(setup, "gpu_infos", return_value=[gpu(0), gpu(1)]), \
+                patch.object(setup, "cpu_info", return_value=("CPU", True, False)), \
+                patch.object(setup, "ram_gb", return_value=64):
+            first = setup.hardware_key(cfg)
+            cfg["args"][cfg["args"].index("--devices") + 1] = "0,1"
+            second = setup.hardware_key(cfg)
+            cfg["args"][cfg["args"].index("--expert-vram-mib") + 1] = "8192"
+            third = setup.hardware_key(cfg)
+        self.assertEqual(len({first, second, third}), 3)
 
 
 class ServingEnvironmentTests(unittest.TestCase):
@@ -478,6 +626,31 @@ class ServingEnvironmentTests(unittest.TestCase):
         for cfg in ({}, {"vision": {"gpu": True}}, {"vision": {"gpu": False, "gpu_uuid": U1}}):
             with self.subTest(cfg=cfg), patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": U0}, clear=True):
                 self.assertEqual(server.child_env(cfg, vision=True)["CUDA_VISIBLE_DEVICES"], U0)
+
+    def test_stale_physical_gpu_field_does_not_mask_multi_device_engine(self):
+        cfg = {"gpu": 2, "args": ["--devices", "1,0"], "vision": {"gpu": True, "gpu_uuid": U1}}
+        env = {"CUDA_VISIBLE_DEVICES": "2,0", "CUDA_DEVICE_ORDER": "FASTEST_FIRST"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(server.child_env(cfg), env)
+            self.assertEqual(server.child_env(cfg, vision=True), dict(env, CUDA_VISIBLE_DEVICES=U1))
+
+    def test_upstream_single_gpu_selection_overrides_stale_vision_uuid(self):
+        cfg = {"gpu": 2, "vision": {"gpu": True, "gpu_uuid": U1}}
+        with patch.dict(os.environ, {}, clear=True):
+            for vision in (False, True):
+                env = server.child_env(cfg, vision=vision)
+                self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "2")
+                self.assertEqual(env["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+
+    def test_server_rejects_physical_override_of_multigpu_config_before_start(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            path.write_text(json.dumps({"args": ["--devices", "0,1"]}))
+            with patch.object(sys, "argv", ["server.py", "--config", str(path), "--gpu", "1"]), \
+                    patch.object(server, "StrataEngine") as engine, patch.object(sys, "stderr", io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                server.main()
+            engine.assert_not_called()
 
     def test_engine_does_not_invent_mask(self):
         with patch.dict(os.environ, {}, clear=True):

@@ -54,7 +54,7 @@ class GpuTelemetry(unittest.TestCase):
         with patch.object(telemetry, "_Nvml") as nvml, \
                 patch.object(telemetry.threading, "Thread"), patch.object(telemetry, "_cpu_name"):
             tel = telemetry.Telemetry()
-        nvml.assert_called_once_with()
+        nvml.assert_called_once_with(0)
         self.assertEqual(len(tel.gpus), 1)
         self.assertIsNone(tel.static["gpus"][0]["uuid"])
 

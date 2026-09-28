@@ -141,6 +141,7 @@ public:
             const int down[LAYERS] = {42, 20}; // Q2_0, IQ4_NL
             std::ofstream manifest(directory_.path() / "native_experts.txt");
             require((bool) manifest, "create native fixture manifest");
+            manifest << "# strata native experts v3 (n_expert " << EXPERTS << ")\n";
             uint64_t offset = 0;
             for (int l = 0; l < LAYERS; ++l) {
                 c::NativeFmt f;
@@ -157,7 +158,10 @@ public:
             throw std::runtime_error("native fixture requested without STRATA_NATIVE_EXPERTS");
 #endif
         }
-        api(c::expert_layout_load(directory_.path().string(), LAYERS, EXPERTS, err), "load synthetic layout", err);
+        // Native packs override the canonical count from their header, as pruned Coder packs do.
+        api(c::expert_layout_load(directory_.path().string(), LAYERS, native ? c::NE : EXPERTS, err),
+            "load synthetic layout", err);
+        require(c::expert_layout().n_expert == EXPERTS, "native header overrides caller's canonical expert count");
         require(c::expert_layout().native == native, "synthetic layout mode");
         if (native) require(c::expert_layout().blob_bytes(0) != c::expert_layout().blob_bytes(1),
                             "native fixture must exercise unequal layer payloads");

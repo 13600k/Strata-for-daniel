@@ -4,7 +4,9 @@
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /health. One sequence at a time behind a FIFO (plan: one resident sequence).
+non-stream), GET /v1/models, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
+ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
 data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
@@ -42,6 +44,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
+from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -55,16 +58,23 @@ class Engine(Protocol):
 
 
 class MockEngine:
-    """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token."""
+    """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.  Given a list of
+    scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
 
-    def __init__(self, tokenizer, script: str, max_context: int = 32768, delay_s: float = 0.0):
+    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
-        self.script = tokenizer.encode(script, parse_special=True) + tokenizer.encode(IM_END, parse_special=True)
+        end = tokenizer.encode(IM_END, parse_special=True)
+        self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
+                                                                                 else script)]
+        self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
+        if len(self.scripts) > 1:
+            self.script = self.scripts[min(self.turns, len(self.scripts) - 1)]
+            self.turns += 1
         for t in self.script[:max_new]:
             if cancel.is_set():
                 return
@@ -75,6 +85,57 @@ class MockEngine:
 
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+
+
+def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
+    """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
+    into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
+    people closed the window thinking it had hung.  The warning comes at that step, not after it."""
+    gb = 0.0
+    if "--native" in args:                              # about the size of the experts it will read
+        try:
+            gb = os.path.getsize(args[args.index("--native") + 1]) / 1e9
+        except (OSError, IndexError):
+            pass
+    size = f"about {gb:.0f} GB" if gb >= 1 else "tens of GB"
+    t0 = last = time.time()
+    said = set()
+
+    def say(key, text):
+        nonlocal last
+        if key not in said:
+            said.add(key)
+            last = time.time()
+            print(text, flush=True)
+
+    say("weights", "[strata] starting the engine: reading the model's weights ...")
+    pos = offset
+    while not done.wait(0.5):
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(pos)
+                chunk = f.read()
+        except OSError:
+            chunk = b""
+        if chunk.count(b"\n"):
+            cut = chunk.rfind(b"\n") + 1
+            pos += cut
+            for line in chunk[:cut].decode("utf-8", "replace").splitlines():
+                if "PLE on" in line or "expert arena:" in line:
+                    say("arena", f"[strata] loading the experts into RAM ({size}) and locking part of them for the GPU.\n"
+                                 "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
+                                 "         Please wait and don't close this window; the browser opens when it is ready.")
+                elif " loaded " in line and "GiB at" in line:
+                    say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
+                        f" ({time.time() - t0:.0f} s so far)")
+                elif "expert cache " in line and " slots, " in line and "auto" not in line:
+                    n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
+                    say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                elif "session is up" in line:
+                    say("up", "[strata] almost ready ...")
+        if time.time() - last > heartbeat:
+            last = time.time()
+            print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
 class StrataEngine:
@@ -91,6 +152,10 @@ class StrataEngine:
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        loading = threading.Event()                     # set once READY: the narrator below stops
+        if log:
+            threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
+                             daemon=True).start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
@@ -112,8 +177,13 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 break
+        loading.set()
         if self.max_context <= 0:
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
+        # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
+        if self.info.get("engine"):
+            self.info["version"] = str(self.info["engine"])
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
@@ -168,6 +238,8 @@ class StrataEngine:
                      "decode_ms": float(f[4]), "finish": f[5]}
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+        if len(f) >= 11:                                  # decode hit rate fields
+            self.last.update(hits=int(f[9]), lookups=int(f[10]))
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -179,8 +251,9 @@ class StrataEngine:
         if isinstance(tp, (int, float)) and float(tp) < 1.0:
             keys += f" top_p={float(tp)!r}"
         tk = sampling.get("top_k")
-        if isinstance(tk, int) and 1 <= tk <= 64:
-            keys += f" top_k={tk}"        # the engine's sampled path takes 1..64; outside it keeps its 20
+        if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
+            # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
+            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -206,6 +279,13 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
+        tune = sampling.get("strata_tune")
+        if isinstance(tune, dict):
+            for k in ("pcie_frac", "spec_min_p"):
+                v = tune.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
+                    keys += f" {k}={float(v)!r}"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -378,15 +458,19 @@ class Vision:
 
 
 def child_env(cfg: dict, *, vision=False) -> dict:
-    """Inherit the environment and prepend setup's CUDA libraries. Only the vision helper is remapped to
-    the primary GPU's UUID: changing the engine's mask would change the meaning of its --devices ordinals."""
+    """Prepend setup's CUDA libraries and apply physical single-GPU selection. With --devices, inherit CUDA's
+    ordinal space unchanged; only vision is remapped to the primary UUID. Ignore stale single-GPU config masks."""
     env = dict(os.environ)
+    physical = cfg.get("gpu") is not None and "--devices" not in cfg.get("args", [])
+    if physical:                   # issue #51: the GPU to run on, numbered as nvidia-smi does; CUDA's
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+        env["CUDA_VISIBLE_DEVICES"] = str(cfg["gpu"])
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     vcfg = cfg.get("vision") or {}
-    if vision and vcfg.get("gpu") and "gpu_uuid" in vcfg:
+    if vision and not physical and vcfg.get("gpu") and "gpu_uuid" in vcfg:
         uid = vcfg["gpu_uuid"]
         if not isinstance(uid, str) or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", uid):
             raise ValueError("vision.gpu_uuid must be a full NVIDIA GPU UUID; run setup again")
@@ -448,8 +532,12 @@ class Service:
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
-        self.history = collections.deque(maxlen=30)     # the last finished requests, newest last (GET /metrics)
+        self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
+        # since the server started (the Monitor's totals, issue #35)
+        self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
+                       "prompt_ms": 0.0, "decode_ms": 0.0}
         self.status_lock = threading.Lock()
+        self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -496,7 +584,8 @@ class Service:
             uuids = raw.split(",") if isinstance(raw, str) and raw else []
             if not all(re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", u) for u in uuids):
                 uuids = []
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s()}, gpu_uuids=uuids)
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s()}, gpu_uuids=uuids,
+                                       gpu_index=int(getattr(self, "gpu_index", 0) or 0))
 
     def _tok_s(self):
         with self.status_lock:
@@ -505,12 +594,13 @@ class Service:
             return 0.0
         return s["generated"] / max(1e-6, time.time() - s["first_token"])
 
-    def metrics(self) -> dict:
+    def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
         with self.status_lock:
             s = dict(self.status)
             hist = list(self.history)
+            totals = dict(self.totals)
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and s.get("first_token") is None:
@@ -530,7 +620,9 @@ class Service:
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        return {"engine": engine, "live": live, "requests": hist[::-1], "hardware": tel["now"], "hardware_static":
+        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+                "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
 
     def prepare(self, messages, tools, kwargs, max_new=None):
@@ -605,7 +697,9 @@ class Service:
             s = dict(self.status)
         el = now - s.get("started", now)
         if s.get("first_token") is None:
-            print(f"[strata] reading the prompt: {s.get('prompt_tokens', 0)} tokens, {el:.0f} s so far", flush=True)
+            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
+            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
+            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
             print(f"[strata] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
@@ -667,6 +761,10 @@ class Service:
                           f"{' Its log: ' + self.engine.log_path if getattr(self.engine, 'log_path', None) else ''}",
                           flush=True)
                     raise
+                except ValueError as e:                 # the engine's ERR line (it may have ended after it)
+                    finish = "error"
+                    print(f"[strata] the engine reported an error: {e}", flush=True)
+                    raise
                 finally:
                     gen.close()                         # STOP+drain to THIS request's DONE while still holding the
                     #                                     fifo, so a stop-token break can't leave the shared engine
@@ -682,6 +780,7 @@ class Service:
                     last = dict(getattr(self.engine, "last", {}) or {})
                     started = self.status.get("started", time.time())
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
+                    hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
                     self.history.append({
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
@@ -689,13 +788,22 @@ class Service:
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
-                        if n and last.get("generated") and last.get("decode_ms") else None})
+                        if n and last.get("generated") and last.get("decode_ms") else None,
+                        "hit_rate": hit_rate})
+                    t = self.totals
+                    t["requests"] += 1
+                    t["prompt_tokens"] += len(ids)
+                    t["reused"] += last.get("reused") or 0
+                    t["output_tokens"] += n
+                    t["prompt_ms"] += last.get("prompt_ms") or 0.0
+                    t["decode_ms"] += last.get("decode_ms") or 0.0
                     now = time.time()
                     el = now - self.status.get("started", now)
                     ft = self.status.get("first_token")
                     rate = n / max(1e-6, now - ft) if ft else 0.0
+                    hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                          f"({finish}, cancel={cancel.is_set()})", flush=True)
+                          f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
@@ -719,8 +827,98 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
 
 
+# ------------------------------------------------------------------------------------------------ MCP tool loop
+def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
+                 mcp_names):
+    """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
+    the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
+    Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
+    one ("done", ...) at the very end with the output tokens of every round.
+
+    `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
+    turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
+    could not reach the model before the client's)."""
+    max_rounds = int(hub.settings["max_rounds"])
+    total, rounds, done = 0, 0, None
+    messages = list(messages)
+    while True:
+        text, reasoning, calls, own_calls = [], [], [], 0
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
+            if kind == "done":
+                done = x
+                continue
+            if kind == "event":
+                ev: Event = x
+                if ev.call is not None and ev.call.name in mcp_names:
+                    if ev.kind == "tool_start":          # the model has started writing a call: say so at once
+                        yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
+                    elif ev.kind == "tool_call":
+                        calls.append(ev.call)
+                    continue                             # its argument pieces are not streamed to the client
+                if ev.kind == "tool_call":
+                    own_calls += 1
+                elif ev.kind == "content":
+                    text.append(ev.text)
+                elif ev.kind == "reasoning":
+                    reasoning.append(ev.text)
+            yield kind, x
+        total += done["completion_tokens"]
+        run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
+        if run_them and rounds >= max_rounds:
+            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+            run_them = False
+        if not run_them:
+            for c in calls:                              # announced, never run: close them in the client's view
+                yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
+                              "chars": 0, "truncated": False, "ms": 0}
+            break
+        rounds += 1
+        results = []
+        for c in calls:
+            s, tool = hub.routes().get(c.name, (None, c.name))
+            yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
+                          "tool": tool, "arguments": c.arguments, "round": rounds}
+            # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
+            # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
+            box = {}
+
+            def work(c=c, box=box):
+                try:
+                    box["r"] = hub.call(c.name, c.arguments, cancel)
+                except McpCancelled:
+                    box["cancelled"] = True
+            worker = threading.Thread(target=work, daemon=True)
+            worker.start()
+            try:
+                while worker.is_alive():
+                    worker.join(1.0)
+                    if worker.is_alive():
+                        yield "ping", None
+            except GeneratorExit:
+                cancel.set()                             # the client is gone: stop the tool too
+                raise
+            if "r" not in box:
+                break
+            r = box["r"]
+            print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
+            results.append(r["text"])
+            yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+        if cancel.is_set() or len(results) < len(calls):
+            done = {**done, "finish": "cancel"}
+            break
+        messages.append({"role": "assistant", "content": "".join(text).strip(),
+                         **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                         "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+        messages += [{"role": "tool", "content": r} for r in results]
+        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+    yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
+
+
 # ------------------------------------------------------------------------------------------------ OpenAI
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+    """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
+    an empty delta and a `strata_mcp` field, which only the web app reads."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
     def chunk(delta, finish=None):
@@ -730,9 +928,13 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     yield chunk({"role": "assistant", "content": ""})
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
         if kind == "ping":
             yield None
+        elif kind == "mcp":
+            c = chunk({})
+            c["strata_mcp"] = x
+            yield c
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
@@ -756,16 +958,19 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         else:
             finish = "tool_calls" if calls and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
-            last["usage"] = {"prompt_tokens": len(ids), "completion_tokens": x["completion_tokens"],
-                             "total_tokens": len(ids) + x["completion_tokens"]}
+            pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
+            last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
+                             "total_tokens": pt + x["completion_tokens"]}
             yield last
 
 
 def openai_collect(chunks) -> dict:
-    content, reasoning, by_index, last = [], [], {}, None
+    content, reasoning, by_index, last, mcp = [], [], {}, None, []
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
+        if c.get("strata_mcp"):
+            mcp.append(c["strata_mcp"])
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -783,6 +988,8 @@ def openai_collect(chunks) -> dict:
         msg["reasoning_content"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
+    if mcp:
+        msg["strata_mcp"] = mcp
     return {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
             "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
             "usage": last["usage"]}
@@ -941,11 +1148,17 @@ def make_handler(svc: Service):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    self._json(200, svc.metrics())
+                    # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
+                    self._json(200, svc.metrics(all_requests="requests=all" in self.path))
                 return
             if path == "/settings":
                 if self._authorized():
                     self._json(200, {"shared": bool(svc.shared), "defaults": svc.shared})
+                return
+            if path == "/mcp":
+                # the MCP servers, their state and tools (the web app's switch and Monitor card)
+                if self._authorized():
+                    self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
             if path == "":
                 body = (ROOT / "serve" / "web" / "index.html").read_bytes()
@@ -977,14 +1190,15 @@ def make_handler(svc: Service):
         def do_POST(self):
             if not self._authorized():
                 return
-            if self.path.rstrip("/") == "/settings":
+            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path == "/settings":
                 self._settings()
                 return
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                if self.path.rstrip("/") == "/v1/chat/completions":
+                if path == "/v1/chat/completions":
                     self._openai(req)
-                elif self.path.rstrip("/") == "/v1/messages":
+                elif path == "/v1/messages":
                     self._anthropic(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
@@ -993,17 +1207,22 @@ def make_handler(svc: Service):
             except EngineDied as e:                          # before the answer started (not streamed)
                 self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
 
-        def _settings(self):
-            # They change what every client gets, so only the app's own page may set them: JSON only (a form or a
-            # "simple" cross-site request can't send it without a CORS preflight, which this server never grants),
-            # and no foreign Origin
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        def _own_page(self, what) -> bool:
+            """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
+            server never grants) and no foreign Origin: a web page elsewhere must not change settings or run tools."""
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
-                return
+                return False
             origin = self.headers.get("Origin")
             if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
-                self._json(403, {"error": {"message": "settings can only be changed from Strata's own page"}})
+                self._json(403, {"error": {"message": f"{what} only from Strata's own page"}})
+                return False
+            return True
+
+        def _settings(self):
+            # They change what every client gets, so only the app's own page may set them
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if not self._own_page("settings can be changed"):
                 return
             try:
                 req = json.loads(body or b"{}")
@@ -1024,11 +1243,22 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
-            max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
+            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            own = {t.get("name") for t in tools or []}
+            if use_mcp:
+                if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
+                    return
+                svc.mcp.wait(10)                                  # servers still starting (only right after start)
+                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                use_mcp = bool(extra)
+                tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel)
+            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                               {t["name"] for t in extra}) if use_mcp else None
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -1045,6 +1275,9 @@ def make_handler(svc: Service):
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except ValueError as e:                          # the engine's ERR after the stream started: the
+                err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _anthropic(self, req):
@@ -1072,6 +1305,9 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except ValueError as e:                          # the engine's ERR after the stream started
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
 
     return Handler
@@ -1235,8 +1471,11 @@ def main() -> int:
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
                          "on your network (set an API key); also \"host\" in the config")
-    ap.add_argument("--script", default="Thinking about it.</think>\n\nHello from the mock engine.")
+    ap.add_argument("--script", action="append",
+                    help="the mock engine's answer (default: a short greeting); given more than once, requests get "
+                         "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--gpu", type=int, help="the GPU to run on, as nvidia-smi numbers them (also \"gpu\" in the config)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
@@ -1245,8 +1484,17 @@ def main() -> int:
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
+    ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
+                                         "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
+                                         "the config)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    if a.gpu is not None:
+        if "--devices" in cfg.get("args", []):
+            ap.error("--gpu cannot override a config with --devices; run setup --setup --gpu N to select one physical GPU")
+        cfg["gpu"] = a.gpu
+    elif "--devices" in cfg.get("args", []):
+        cfg.pop("gpu", None)                          # old mixed configs must not mask away secondary GPUs
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -1268,6 +1516,7 @@ def main() -> int:
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
+    hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -1285,7 +1534,8 @@ def main() -> int:
         engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
-        engine, vision, sampling_defaults = MockEngine(tok, a.script), None, {}
+        engine, vision, sampling_defaults = MockEngine(tok, a.script or [
+            "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
@@ -1293,6 +1543,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
@@ -1302,6 +1553,13 @@ def main() -> int:
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    if hub is not None:
+        import atexit
+        svc.mcp = hub
+        print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
+              f"chat: {', '.join(hub.servers)}", flush=True)
+        hub.start()
+        atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
@@ -1334,6 +1592,8 @@ def main() -> int:
             engine.close()
         if vision:
             vision.close()
+        if hub is not None:
+            hub.close()
     return 0
 
 

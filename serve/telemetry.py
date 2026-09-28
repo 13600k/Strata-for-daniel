@@ -175,14 +175,15 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_uuids=None):
-        """`extra()` supplies series. Optional UUIDs are in engine selection order, primary first."""
+    def __init__(self, extra=None, gpu_index=0, *, gpu_uuids=None):
+        """`extra()` supplies series. UUIDs select GPUs in engine order, primary first; otherwise `gpu_index`
+        selects the card as nvidia-smi/NVML number it (backwards compatible with single-GPU engines)."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         self.gpu_uuids = list(gpu_uuids or [])
-        self.gpus = [_Nvml(uuid=u) for u in self.gpu_uuids] if self.gpu_uuids else [_Nvml()]
+        self.gpus = [_Nvml(uuid=u) for u in self.gpu_uuids] if self.gpu_uuids else [_Nvml(gpu_index)]
         self.gpu = self.gpus[0]  # legacy scalar charts describe the actual primary
         try:
             import psutil  # noqa: F401

@@ -85,6 +85,20 @@ void ranking() {
     check(full.at(8000) == p::ExpertId{16, 0} && full.at(8031) == p::ExpertId{47, 0} &&
               full.at(8032) == p::ExpertId{16, 1}, "unranked late layers are interleaved, not starved");
     check(full.back() == p::ExpertId{47, 511}, "completion reaches final layer and expert");
+
+    const auto coder = p::complete_expert_ranking({}, 48, 256);
+    check(coder.size() == 48 * 256, "pruned Coder uses its own 256-expert geometry");
+    std::vector<p::ExpertLocation> loc(coder.size());
+    std::vector<uint64_t> sizes(48, 1024);
+    const auto first = p::fit_experts(coder, loc, sizes, 256, 50 * 1024);
+    for (size_t i = 0; i < first.size(); ++i)
+        loc[(size_t) first[i].first * 256 + first[i].second] = {0, (int32_t) i};
+    const auto second = p::fit_experts(coder, loc, sizes, 256, 70 * 1024);
+    check(first.size() == 50 && second.size() == 70, "pruned model uses heterogeneous cache budgets");
+    std::set<p::ExpertId> residents(first.begin(), first.end());
+    for (auto id : second)
+        check(residents.insert(id).second && id.first < 48 && id.second < 256,
+              "pruned secondary residency is complementary and bounded");
 }
 
 void fitting() {

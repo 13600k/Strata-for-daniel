@@ -155,6 +155,13 @@ A model this big doesn't fit on a gaming graphics card. Strata splits the work b
 
 The full story is in the [paper](docs/paper/Strata-Paper.pdf) and the [details](docs/DETAILS.md).
 
+### Experimental multi-GPU experts
+
+Source builds can use additional NVIDIA GPUs as complementary adaptive expert caches, without requiring NVLink or
+peer-to-peer access. The primary GPU still runs attention, context state and batched prompt processing. This path is
+**experimental and not yet hardware-validated**; 4-bit model support and a reduced host-RAM footprint are not included.
+See [multi-GPU setup, limitations and validation](docs/MULTI-GPU.md) before enabling `--devices 0,1`.
+
 ## Credits
 
 - Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by

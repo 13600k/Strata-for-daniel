@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -376,14 +377,20 @@ class Vision:
             self.proc.kill()
 
 
-def child_env(cfg: dict) -> dict:
-    """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
-    compiled it) first on the library search path."""
+def child_env(cfg: dict, *, vision=False) -> dict:
+    """Inherit the environment and prepend setup's CUDA libraries. Only the vision helper is remapped to
+    the primary GPU's UUID: changing the engine's mask would change the meaning of its --devices ordinals."""
     env = dict(os.environ)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
+    vcfg = cfg.get("vision") or {}
+    if vision and vcfg.get("gpu") and "gpu_uuid" in vcfg:
+        uid = vcfg["gpu_uuid"]
+        if not isinstance(uid, str) or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", uid):
+            raise ValueError("vision.gpu_uuid must be a full NVIDIA GPU UUID; run setup again")
+        env["CUDA_VISIBLE_DEVICES"] = uid
     return env
 
 
@@ -485,7 +492,11 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s()})
+            raw = getattr(self.engine, "info", {}).get("gpu_uuids", "")
+            uuids = raw.split(",") if isinstance(raw, str) and raw else []
+            if not all(re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", u) for u in uuids):
+                uuids = []
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s()}, gpu_uuids=uuids)
 
     def _tok_s(self):
         with self.status_lock:
@@ -1269,7 +1280,7 @@ def main() -> int:
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=env)
+                            env=child_env(cfg, vision=True))
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         warn_tight_ram(engine.info.get("arena_mib"))

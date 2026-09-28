@@ -13,6 +13,15 @@ namespace strata::kernels {
 
 /// ggml type ids handled here.
 bool iq_supported(int ggml_type) noexcept;
+// End-to-end grouped expert support is narrower than dense MMVQ/dequantization.
+// GGML types: IQ2_XXS=16, IQ2_XS=17, IQ3_XXS=18, IQ4_NL=20,
+// IQ3_S=21, IQ2_S=22, IQ4_XS=23, IQ1_M=29, Q2_0=42. The IQ3_S model uses IQ4_XS.
+// Block alignment is validated separately by native_fmt; a listed type is not enough.
+inline bool native_expert_supported(int gate_up, int down) noexcept {
+    return (gate_up == 16 || gate_up == 17 || gate_up == 18 || gate_up == 21 ||
+            gate_up == 22 || gate_up == 23 || gate_up == 29 || gate_up == 42) &&
+           (down == 20 || down == 23 || down == 42);
+}
 /// Bytes of one row of `n` values of `ggml_type` (n a multiple of the type's block).
 size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 

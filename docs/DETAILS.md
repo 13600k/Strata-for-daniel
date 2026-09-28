@@ -52,6 +52,9 @@ Time to first token is prompt length / prompt speed: about 7 s at 4K, 55 s at 32
 
 ## Other GPUs (estimated)
 
+For **multiple GPUs in one engine**, see [experimental adaptive expert caches](MULTI-GPU.md). That source-build path
+has separate validation requirements; the estimates below are **single-GPU** estimates, not multi-GPU measurements.
+
 Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU
 part by how many more experts the card's VRAM holds. Treat as **±20%**. Numbers are *prompt / output* tokens/s.
 

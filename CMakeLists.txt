@@ -4,9 +4,8 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2 and this build REJECTS any architecture other than 120: the engine is
-# written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
-# binary that runs and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA kernels require compute capability >= 8.0. Local builds can target native;
+# redistributable builds should explicitly list their supported CUDA architectures.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.0 LANGUAGES CXX)
 
@@ -33,15 +32,31 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
+# Self-contained tests shipped in this tree, independent of the omitted legacy suite.
+option(STRATA_BUILD_PORTABLE_TESTS "Build host-only expert placement tests" ON)
+option(STRATA_BUILD_MULTI_GPU_TESTS "Build synthetic two-GPU expert tests (no model required)" OFF)
+if(STRATA_BUILD_TESTS OR STRATA_BUILD_PORTABLE_TESTS OR STRATA_BUILD_MULTI_GPU_TESTS)
+  enable_testing()
+endif()
+if(STRATA_BUILD_MULTI_GPU_TESTS AND NOT STRATA_ENABLE_CUDA)
+  message(FATAL_ERROR "STRATA_BUILD_MULTI_GPU_TESTS requires STRATA_ENABLE_CUDA=ON")
+endif()
 
 if(STRATA_ENABLE_CUDA)
+  # Local builds target the visible GPU(s); portable releases/cross builds pass an
+  # explicit list, e.g. -DCMAKE_CUDA_ARCHITECTURES="86;89;120" with a suitable toolkit.
+  # Set this BEFORE enable_language, which otherwise supplies a compiler default.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    if(DEFINED ENV{CUDAARCHS} AND NOT "$ENV{CUDAARCHS}" STREQUAL "")
+      set(CMAKE_CUDA_ARCHITECTURES "$ENV{CUDAARCHS}" CACHE STRING "CUDA architectures")
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures")
+    endif()
+  endif()
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
-  endif()
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Plan v0.3 P6: developed and measured on sm_120 (RTX 50); the kernels need sm_80 or newer (tf32 mma in
@@ -103,10 +118,14 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
+if(STRATA_BUILD_PORTABLE_TESTS)
+  add_executable(expert_placement_test src/plan/expert_placement_test.cpp)
+  target_link_libraries(expert_placement_test PRIVATE strata_plan)
+  add_test(NAME expert_placement COMMAND expert_placement_test)
+endif()
 
 # ---- strata_core (CUDA, Phase 2) ------------------------------------------
-# Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit.  The arch
-# guard above has already refused anything but sm_120 by the time this runs.
+# Only built when CUDA is on; artifact and planning tools do not need a toolkit.
 if(STRATA_ENABLE_CUDA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
@@ -239,9 +258,15 @@ if(STRATA_ENABLE_CUDA)
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
+    src/core/expert_cache.cpp src/core/multi_gpu.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
+  if(STRATA_BUILD_MULTI_GPU_TESTS)
+    add_executable(multi_gpu_test src/core/multi_gpu_test.cpp)
+    target_link_libraries(multi_gpu_test PRIVATE strata_engine CUDA::cudart)
+    add_test(NAME multi_gpu_experts COMMAND multi_gpu_test)
+    set_tests_properties(multi_gpu_experts PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  endif()
 
   # `strata generate` (P2.S6).  The FIRST user-facing program: everything under it is a component, and this is
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
@@ -498,12 +523,11 @@ if(STRATA_NATIVE_EXPERTS)
     FetchContent_Declare(strata_llamacpp
       GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
       GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
-      GIT_SHALLOW FALSE)
-    FetchContent_GetProperties(strata_llamacpp)
-    if(NOT strata_llamacpp_POPULATED)
-      FetchContent_Populate(strata_llamacpp)
-    endif()
-    add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+      GIT_SHALLOW FALSE
+      SOURCE_SUBDIR ggml)
+    # The one-argument FetchContent_Populate form is rejected by newer CMake.
+    # Populate only ggml, not llama.cpp's complete build, on CMake 3.24 and newer.
+    FetchContent_MakeAvailable(strata_llamacpp)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
@@ -551,9 +575,15 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(pool_test PRIVATE strata_kernels_cpu)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   # issue #29: tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
+endif()
+
+# The pool race is most visible when almost every expert is served by a GPU.
+# Keep its model-free stress test available without the omitted legacy test suite.
+if(STRATA_BUILD_TESTS OR STRATA_BUILD_MULTI_GPU_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+  set_tests_properties(pool_stress PROPERTIES TIMEOUT 90)
 endif()
 
 if(STRATA_BUILD_TESTS)

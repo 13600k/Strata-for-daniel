@@ -28,7 +28,7 @@ class _Nvml:
     class Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
-    def __init__(self, index=0):
+    def __init__(self, index=0, uuid=None):
         self.lib = self.dev = None
         names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
                                           "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
@@ -47,8 +47,14 @@ class _Nvml:
                 self.lib = None
                 return
             h = ctypes.c_void_p()
-            get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
-            if get(ctypes.c_uint(index), ctypes.byref(h)) != 0:
+            if uuid is not None:
+                # CUDA ordinals may be reordered/masked. Never substitute physical
+                # index zero if the selected UUID is unavailable.
+                status = self.lib.nvmlDeviceGetHandleByUUID(uuid.encode("ascii"), ctypes.byref(h))
+            else:
+                get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
+                status = get(ctypes.c_uint(index), ctypes.byref(h))
+            if status != 0:
                 self.lib = None
                 return
             self.dev = h
@@ -169,13 +175,15 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None):
-        """`extra()` -> dict of more series to record each second (the server's tok/s)."""
+    def __init__(self, extra=None, gpu_uuids=None):
+        """`extra()` supplies series. Optional UUIDs are in engine selection order, primary first."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        self.gpu = _Nvml()
+        self.gpu_uuids = list(gpu_uuids or [])
+        self.gpus = [_Nvml(uuid=u) for u in self.gpu_uuids] if self.gpu_uuids else [_Nvml()]
+        self.gpu = self.gpus[0]  # legacy scalar charts describe the actual primary
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -184,6 +192,9 @@ class Telemetry:
         self.fallback = _CpuRamFallback()
         self.static = {
             "gpu_name": self.gpu.name() if self.gpu.ok() else None,
+            "gpus": [{"uuid": self.gpu_uuids[i] if self.gpu_uuids else None,
+                      "name": g.name() if g.ok() else None, "role": "primary" if i == 0 else "experts"}
+                     for i, g in enumerate(self.gpus)],
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
@@ -207,10 +218,12 @@ class Telemetry:
         return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
 
     def sample(self):
-        s = {}
-        if self.gpu.ok():
-            g = self.gpu.read()
-            s.update({f"gpu_{k}": v for k, v in g.items()})
+        s = {"gpus": []}
+        for i, gpu in enumerate(self.gpus):
+            reading = gpu.read() if gpu.ok() else {}
+            s["gpus"].append(dict(self.static["gpus"][i], **reading))
+            if i == 0:
+                s.update({f"gpu_{k}": v for k, v in reading.items()})
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)

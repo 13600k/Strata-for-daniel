@@ -26,11 +26,24 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
 
 }  // namespace
 
+DeviceScope::DeviceScope(int ordinal) {
+    check(cudaGetDevice(&previous_), "cudaGetDevice");
+    check(cudaSetDevice(ordinal), "cudaSetDevice");
+}
+
+DeviceScope::~DeviceScope() {
+    if (previous_ >= 0) (void) cudaSetDevice(previous_);
+}
+
+void device_check_kernels(int ordinal) {
+    DeviceArena probe(256, ordinal, true);
+}
+
 DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-        throw CudaError("no CUDA device is present; Strata targets sm_120 (RTX 5000 series)", -1);
+        throw CudaError("no CUDA device is present; Strata requires an NVIDIA GPU with compute capability >= 8.0", -1);
     }
     if (ordinal < 0 || ordinal >= count) {
         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
@@ -39,11 +52,18 @@ DeviceInfo device_info(int ordinal) {
     }
     DeviceInfo d;
     d.ordinal = ordinal;
-    check(cudaSetDevice(ordinal), "cudaSetDevice");
+    DeviceScope scope(ordinal);
 
     cudaDeviceProp p{};
     check(cudaGetDeviceProperties(&p, ordinal), "cudaGetDeviceProperties");
     d.name = p.name;
+    d.uuid = "GPU-";
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) d.uuid += '-';
+        char hex[3];
+        std::snprintf(hex, sizeof(hex), "%02x", (unsigned int) (unsigned char) p.uuid.bytes[i]);
+        d.uuid += hex;
+    }
     d.cc_major = p.major;
     d.cc_minor = p.minor;
     d.multi_processor_count = p.multiProcessorCount;
@@ -56,14 +76,9 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
-    // is caught here, because a binary can be carried to a machine with an older card and would otherwise
-    // silently take whatever path the driver chose.
-    if (d.cc_major != 12) {
+    if (d.cc_major < 8) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
-                            "." + std::to_string(d.cc_minor) +
-                            "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",
-                        -1);
+                            "." + std::to_string(d.cc_minor) + "; Strata requires compute capability >= 8.0", -1);
     }
     return d;
 }
@@ -71,28 +86,40 @@ DeviceInfo device_info(int ordinal) {
 DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     : capacity_(bytes), ordinal_(ordinal), poison_(poison) {
     if (bytes == 0) throw CudaError("DeviceArena of 0 bytes", -1);
-    check(cudaSetDevice(ordinal), "cudaSetDevice");
+    DeviceScope scope(ordinal);
     // One allocation for the whole region.  cudaMalloc of a large block is the thing that can fail late, so it
     // happens once, here, before anything depends on it.
     check(cudaMalloc(&base_, (size_t) bytes), "cudaMalloc");
-    if (poison_) {
-        const int threads = 256;
-        const uint64_t n = bytes / sizeof(float);
-        const uint64_t blocks = (n + threads - 1) / threads;
-        // gridDim.x is 32-bit, so a large region needs a loop.  12 GB of floats is 3e9 elements = 1.2e7
-        // blocks, which fits, but the loop keeps it correct for any size rather than for today's sizes.
-        const uint64_t max_blocks = 0x7FFFFFFFull;
-        for (uint64_t b = 0; b < blocks; b += max_blocks) {
-            const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
-            poison_kernel<<<(unsigned) chunk, threads>>>((float*) base_ + b * threads, n - b * threads);
-            check(cudaGetLastError(), "poison_kernel");
+    try {
+        if (poison_) {
+            const int threads = 256;
+            const uint64_t n = bytes / sizeof(float);
+            const uint64_t blocks = (n + threads - 1) / threads;
+            // gridDim.x is 32-bit; retain the chunking for unusually large regions.
+            const uint64_t max_blocks = 0x7FFFFFFFull;
+            for (uint64_t b = 0; b < blocks; b += max_blocks) {
+                const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
+                poison_kernel<<<(unsigned) chunk, threads>>>((float*) base_ + b * threads, n - b * threads);
+                check(cudaGetLastError(), "poison_kernel");
+            }
+            check(cudaDeviceSynchronize(), "poison sync");
         }
-        check(cudaDeviceSynchronize(), "poison sync");
+    } catch (...) {
+        // A constructor that throws will not run ~DeviceArena. In particular, the
+        // startup probe must not leak its allocation when this build lacks an SM image.
+        (void) cudaFree(base_);
+        base_ = nullptr;
+        throw;
     }
 }
 
 DeviceArena::~DeviceArena() {
-    if (base_) cudaFree(base_);          // best effort: a destructor must not throw
+    if (base_) {
+        int previous = -1;
+        (void) cudaGetDevice(&previous);
+        if (cudaSetDevice(ordinal_) == cudaSuccess) (void) cudaFree(base_);
+        if (previous >= 0) (void) cudaSetDevice(previous);
+    }
 }
 
 void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {

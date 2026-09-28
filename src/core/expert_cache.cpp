@@ -104,6 +104,10 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
+    if (cudaGetDevice(&ordinal_) != cudaSuccess) {
+        err = "ExpertCache: cannot determine owning device";
+        return false;
+    }
     if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
         char buf[256];
@@ -161,9 +165,13 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 void ExpertCache::close() {
     off_.clear();
     if (base_ != nullptr) {
-        cudaFree(base_);
+        int previous = -1;
+        (void) cudaGetDevice(&previous);
+        if (cudaSetDevice(ordinal_) == cudaSuccess) (void) cudaFree(base_);
+        if (previous >= 0) (void) cudaSetDevice(previous);
         base_ = nullptr;
     }
+    ordinal_ = -1;
     residency_.clear();
     slots_ = 0;
     n_layers_ = 0;

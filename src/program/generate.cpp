@@ -15,6 +15,10 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/device.hpp"
+#include "strata/core/multi_gpu.hpp"
+#include "strata/plan/expert_placement.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
@@ -61,6 +65,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -77,6 +82,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 struct Options {
+    std::string devices = "0";       // CUDA-visible ordinals; first is the primary
+    bool list_devices = false;
+    int expert_vram_mib = 0;          // cap per secondary, 0 = auto
+    int expert_reserve_mib = 1024;    // margin per secondary, after worker buffers
+    int expert_adapt_mib = 128;       // upload byte budget across tiers per adaptation
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
@@ -278,6 +288,12 @@ void usage() {
     std::fprintf(stderr,
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
                  "\n"
+                 "  --devices LIST       CUDA-visible ordinals, primary first (default 0); e.g. 0,1\n"
+                 "                       multi-GPU experts need --native, --spec, --prefill and a profile\n"
+                 "  --list-devices       report CUDA devices and exit (no model needed)\n"
+                 "  --expert-vram-mib N  cache cap per secondary GPU, 0 = auto (default)\n"
+                 "  --expert-reserve-mib N  free VRAM margin per secondary (default 1024 MiB)\n"
+                 "  --expert-adapt-mib N  multi-GPU upload budget per adaptation (default 128 MiB)\n"
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
@@ -666,7 +682,21 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
+        auto mib = [&](const char* flag) {
+            const std::string value = next(flag);
+            int n = -1;
+            const auto r = std::from_chars(value.data(), value.data() + value.size(), n);
+            if (r.ec != std::errc() || r.ptr != value.data() + value.size() || n < 0) {
+                std::fprintf(stderr, "%s requires a nonnegative integer\n", flag); std::exit(2);
+            }
+            return n;
+        };
         if (a == "--help" || a == "-h") { usage(); return 0; }
+        else if (a == "--devices") o.devices = next("--devices");
+        else if (a == "--list-devices") o.list_devices = true;
+        else if (a == "--expert-vram-mib") o.expert_vram_mib = mib("--expert-vram-mib");
+        else if (a == "--expert-reserve-mib") o.expert_reserve_mib = mib("--expert-reserve-mib");
+        else if (a == "--expert-adapt-mib") o.expert_adapt_mib = mib("--expert-adapt-mib");
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
@@ -834,6 +864,32 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (o.list_devices) {
+        int count = 0;
+        const auto status = cudaGetDeviceCount(&count);
+        if (status != cudaSuccess) { std::fprintf(stderr, "%s\n", cudaGetErrorString(status)); return 1; }
+        for (int i = 0; i < count; ++i) {
+            try {
+                const auto d = strata::core::device_info(i);
+                std::printf("%d: %s, sm_%d%d, %.0f MiB total / %.0f MiB free\n", i, d.name.c_str(),
+                            d.cc_major, d.cc_minor, (double) d.total_bytes / 1048576, (double) d.free_bytes / 1048576);
+            } catch (const std::exception& e) { std::printf("%d: %s\n", i, e.what()); }
+        }
+        return count ? 0 : 1;
+    }
+    std::vector<int> devices;
+    try { devices = strata::plan::parse_devices(o.devices); }
+    catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
+    const int primary_device = devices.front();
+    const bool multi_gpu = devices.size() > 1;
+    if (multi_gpu && (o.spec < 2 || o.spec > strata::kernels::cpu::MAXT || o.native_preset.empty() ||
+        o.prefill_chunk <= 0 || o.expert_profile.empty() || o.expert_cache == 0 || o.no_pool ||
+        o.no_capture || o.no_token_graph || o.expert_cache_per_layer || !o.dump_layers.empty() ||
+        !o.dump_halves.empty() || o.graph_only || o.gpu_only_full || o.gpu_stages || o.stage_timing)) {
+        std::fprintf(stderr, "multi-GPU experts need --native, --spec 2..8, --prefill, --expert-profile and "
+                             "--expert-cache auto|N with the normal captured verification path\n");
+        return 2;
+    }
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
         o.max_new = 1;
@@ -948,6 +1004,22 @@ int main(int argc, char** argv) {
     strata::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
 
     std::string err;
+    std::string device_uuids;
+    try {
+        for (int ordinal : devices) {
+            const auto d = strata::core::device_info(ordinal);
+            strata::core::device_check_kernels(ordinal);
+            if (!device_uuids.empty()) device_uuids += ',';
+            device_uuids += d.uuid;
+            std::fprintf(stderr, "strata: %s device %d: %s (sm_%d%d), %.0f MiB free\n",
+                         ordinal == primary_device ? "primary" : "expert", ordinal, d.name.c_str(),
+                         d.cc_major, d.cc_minor, (double) d.free_bytes / 1048576.0);
+        }
+        if (cudaSetDevice(primary_device) != cudaSuccess) throw std::runtime_error("cannot select primary GPU");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata: %s\nBuild with CMAKE_CUDA_ARCHITECTURES covering every selected device.\n", e.what());
+        return 1;
+    }
     if (!o.native_head_gguf.empty() && !o.stream_token) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
@@ -963,6 +1035,19 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
+    if (native_pack) {
+        const auto& formats = strata::kernels::cpu::expert_layout().fmt;
+        for (size_t l = 0; l < formats.size(); ++l) {
+            const auto& f = formats[l];
+            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type)) {
+                std::fprintf(stderr, "strata: layer %zu uses unsupported grouped expert types %d/%d. "
+                                     "Dense 4-bit support does not imply expert support; use a validated "
+                                     "Q2_0/IQ2_XS/IQ3_XXS/IQ3_S pack. No weights were requantized.\n",
+                             l, f.gu_type, f.d_type);
+                return 2;
+            }
+        }
+    }
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
     if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
@@ -1303,8 +1388,12 @@ int main(int argc, char** argv) {
         // an explicit smaller number is allowed and simply truncates the ranked list, which is the right
         // behaviour for asking "what would 2,000 slots give" without rebuilding the file.
         if (o.expert_cache == 0) o.expert_cache = (int) pslots;
-        std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
-                     o.expert_profile.c_str(), profile.size(), (long long) pslots);
+        const size_t ranked_count = profile.size();
+        try { profile = strata::plan::complete_expert_ranking(profile, g.n_layers, g.n_expert); }
+        catch (const std::exception& e) { std::fprintf(stderr, "strata: %s\n", e.what()); return 2; }
+        std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, %zu candidates after completing "
+                             "the unranked tail (profile size is not a VRAM limit)\n",
+                     o.expert_profile.c_str(), ranked_count, profile.size());
     }
     // THE HEAD BEFORE THE CACHE.  The expert cache takes what is free minus the reserve, so everything allocated
     // after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after it and ate most of
@@ -2063,6 +2152,24 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: token graph captured (48 layers, one launch per token)\n");
     }
 
+    // Secondary tiers contain only experts not resident on the primary. Their
+    // locations are deliberately NOT encoded into host_res: legacy prefill and
+    // single-token kernels must never dereference a secondary pointer as local VRAM.
+    std::unique_ptr<strata::core::MultiGpuExperts> remote;
+    if (multi_gpu) {
+        remote = std::make_unique<strata::core::MultiGpuExperts>();
+        const std::vector<int> secondary(devices.begin() + 1, devices.end());
+        if (!remote->init(primary_device, secondary, xcache, host_res, d_res, *srcp, profile,
+                          g.n_layers, g.n_expert, o.spec, (uint64_t) o.expert_reserve_mib << 20,
+                          (uint64_t) o.expert_vram_mib << 20, err)) {
+            std::fprintf(stderr, "strata multi-GPU: %s\n", err.c_str());
+            return 1;
+        }
+        drive.d.remote = remote.get();
+        std::fprintf(stderr, "strata multi-GPU: batched prefill stays on the primary; secondary experts are used "
+                             "by generation and short-prompt verification windows, including T=1.\n");
+    }
+
     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
     //
     // **`--gpu-only-full` MEASURES THE 48 LAYER GRAPHS AND THE LM HEAD AND NOTHING ELSE.**  It never enters
@@ -2222,17 +2329,26 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
-        auto apply_pending = [&](bool wait) {
-            if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+        auto apply_pending = [&](bool wait) -> bool {
+            if (remote) return remote->publish(wait, err);
+            if (pending.empty()) return true;
+            const auto status = wait ? cudaEventSynchronize(adapt_ev) : cudaEventQuery(adapt_ev);
+            if (status == cudaErrorNotReady) return true;
+            if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
-            if (d_res != nullptr)
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            if (d_res != nullptr && cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t),
+                                              cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "adaptive residency upload failed"; return false;
+            }
+            return true;
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        std::string adapt_error;
         auto adapt = [&]() -> bool {
+            if (remote) return remote->adapt(drive.d.usage, o.adapt_swaps, (uint64_t) o.expert_adapt_mib << 20, adapt_error);
+            // CUDA device selection is thread-local: this lambda runs on an adaptation thread.
+            if (cudaSetDevice(primary_device) != cudaSuccess) return false;
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -2330,12 +2446,12 @@ int main(int argc, char** argv) {
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
-                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld\n",
+                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s devices=%s gpu_uuids=%s arena_mib=%lld\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
-                        o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
+                        o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(), o.devices.c_str(), device_uuids.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20));
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
@@ -2676,7 +2792,7 @@ int main(int argc, char** argv) {
                 lent_now.clear();
                 return true;
             };
-            apply_pending(true);
+            if (!apply_pending(true)) { std::printf("ERR %s\n", err.c_str()); return 1; }
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
@@ -2791,7 +2907,7 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
-                apply_pending(false);
+                if (!apply_pending(false)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 if (hist_n > 0) {
                     // the tail the penalties count over: the tokens the state has consumed plus the fed-back
                     // head `x` (it joins `consumed` only after this window commits).  Most recent LAST,
@@ -2841,7 +2957,7 @@ int main(int argc, char** argv) {
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR an adaptive refill failed: %s\n", adapt_error.c_str());
                     return 1;
                 }
                 if (!drafted) {
@@ -2857,6 +2973,7 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (remote) remote->report();
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
                 // (the checkpoints taken while reading it are still good)
@@ -2976,7 +3093,7 @@ int main(int argc, char** argv) {
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
     int64_t pos_start = 0;
-    int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
+    int64_t spec_pos = -1;  // -1 = unused; position 0 is valid for a one-token native prompt
     strata::prefill::Prefill prefill;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
@@ -3286,7 +3403,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
+    if (spec_pos >= 0 && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (!o.spec_oracle.empty()) {
             std::ifstream in(o.spec_oracle);
@@ -3338,20 +3455,32 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
-        auto apply_pending = [&](bool wait) {
-            if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+        auto apply_pending = [&](bool wait) -> bool {
+            if (remote) return remote->publish(wait, err);
+            if (pending.empty()) return true;
+            const auto status = wait ? cudaEventSynchronize(adapt_ev) : cudaEventQuery(adapt_ev);
+            if (status == cudaErrorNotReady) return true;
+            if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
-            if (d_res != nullptr)
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            if (d_res != nullptr && cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t),
+                                              cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "adaptive residency upload failed"; return false;
+            }
+            return true;
         };
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
+        std::string adapt_error;
         auto adapt = [&]() -> bool {
             const Clock::time_point ta = Clock::now();
+            if (remote) {
+                const bool ok = remote->adapt(drive.d.usage, o.adapt_swaps, (uint64_t) o.expert_adapt_mib << 20, adapt_error);
+                ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                return ok;
+            }
+            if (cudaSetDevice(primary_device) != cudaSuccess) return false;
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -3460,7 +3589,7 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            apply_pending(false);
+            if (!apply_pending(false)) { std::fprintf(stderr, "strata: %s\n", err.c_str()); return 1; }
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -3501,13 +3630,17 @@ int main(int argc, char** argv) {
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
+                if (!adapt_ok) { std::fprintf(stderr, "strata: adaptive refill failed: %s\n", adapt_error.c_str()); return 1; }
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
             if (adapt_thr.joinable()) adapt_thr.join();
-            if (!adapt_ok) return 1;
+            if (!adapt_ok) {
+                std::fprintf(stderr, "strata: adaptive refill failed: %s\n", adapt_error.c_str());
+                return 1;
+            }
             if (!drafted) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -3736,6 +3869,7 @@ int main(int argc, char** argv) {
 
     if (dump != nullptr) std::printf("%-24s %s\n", "logits dumped", o.dump_logits.c_str());
 
+    if (remote) remote->report();
     strata::core::session_graphs_free(gr);
     strata::core::doorbell_free(db);
     cudaFree(d_next);

@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/multi_gpu.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "strata/core/pinned.hpp"
@@ -275,10 +276,25 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
-    // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
-    // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
+    // Secondary GPUs are launched before planning/CPU work. Their rows return through
+    // the existing mapped result buffer; the verifier's CPU-completion flag covers
+    // both producers, so the primary graph never sees a half-finished remote result.
     const int64_t n = n_tok * k;
-    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    if (k != 10 || n > 128) {
+        d.failed = true; d.fail = "invalid expert window geometry"; return;
+    }
+    uint8_t remote[128] = {};
+    if (d.remote && !d.remote->launch(d.layers, x_f, ids, (int) n_tok, (int) k, remote, d.remote_error)) {
+        d.failed = true; d.fail = d.remote_error.c_str(); d.fail_layer = d.layers; return;
+    }
+    // Drain secondary work even on a later source/validation error. The verifier will
+    // discard this window when dispatch.failed is set; its staging may then be reused.
+    struct RemoteDrain {
+        MultiGpuExperts* tier;
+        ~RemoteDrain() { if (tier) { std::string ignored; tier->finish(nullptr, ignored); } }
+    } remote_drain{d.remote};
+    // ---- primary GPU plan, published FIRST so it starts while the CPU works.
+    int32_t kind[128];                     // per entry: -1 CPU, 0 local VRAM, 1 PCIe, 2 remote GPU
     if (d.plan != nullptr && n <= 128 && n <= d.plan->cap) {
         int64_t distinct[128], first_of[128];
         int nd = 0, nmiss = 0;
@@ -289,7 +305,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (first_of[i] == i) {
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
-                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
+                if (!remote[i] && e >= 0 && e < d.n_expert &&
+                    d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
@@ -301,9 +318,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
-            int kd = -1;
+            int kd = remote[i0] ? 2 : -1;
             unsigned long long ptr = 0;
-            if (e >= 0 && e < d.n_expert) {
+            if (!remote[i0] && e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
                 if (slot >= 0) {
                     kd = 0;
@@ -362,7 +379,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
-            kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
+            kind[i] = remote[i] ? 2 : (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0 : -1;
         }
     }
@@ -421,6 +438,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("run", njobs);
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    if (d.remote) {
+        const bool ok = d.remote->finish(out, d.remote_error);
+        remote_drain.tier = nullptr;
+        if (!ok) { d.failed = true; d.fail = d.remote_error.c_str(); d.fail_layer = d.layers; return; }
+    }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };

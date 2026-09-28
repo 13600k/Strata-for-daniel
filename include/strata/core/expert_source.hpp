@@ -31,6 +31,8 @@
 
 namespace strata::core {
 
+class MultiGpuExperts;
+
 /// Where one routed expert's bytes come from.
 ///
 /// Phase 2 has NO cache (`phase-2-correct-engine.md`: hit rate `h = 0`), so the only implementation is a
@@ -204,6 +206,8 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
+    MultiGpuExperts* remote = nullptr;    ///< optional complementary GPUs; verification windows only
+    std::string remote_error;             ///< owns the diagnostic referenced by fail
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
@@ -328,7 +332,7 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
-    int64_t reads() const { return reads_; }
+    int64_t reads() const override { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
 

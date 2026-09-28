@@ -137,6 +137,7 @@ public:
 
 private:
     uint8_t* base_ = nullptr;
+    int ordinal_ = -1;              ///< owning CUDA device, recorded at open
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;

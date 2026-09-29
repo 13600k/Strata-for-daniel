@@ -4,10 +4,11 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA kernels require compute capability >= 8.0. Local builds can target native;
-# redistributable builds should explicitly list their supported CUDA architectures.
+# CUDA targets arrive in Phase 2.  The kernels need sm_80 or newer (tf32 mma, bf16 math) and the guard
+# below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
+# and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.20 LANGUAGES CXX)
+project(strata VERSION 0.1.24 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
@@ -39,31 +40,15 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
-# Self-contained tests shipped in this tree, independent of the omitted legacy suite.
-option(STRATA_BUILD_PORTABLE_TESTS "Build host-only expert placement tests" ON)
-option(STRATA_BUILD_MULTI_GPU_TESTS "Build synthetic two-GPU expert tests (no model required)" OFF)
-if(STRATA_BUILD_TESTS OR STRATA_BUILD_PORTABLE_TESTS OR STRATA_BUILD_MULTI_GPU_TESTS)
-  enable_testing()
-endif()
-if(STRATA_BUILD_MULTI_GPU_TESTS AND NOT STRATA_ENABLE_CUDA)
-  message(FATAL_ERROR "STRATA_BUILD_MULTI_GPU_TESTS requires STRATA_ENABLE_CUDA=ON")
-endif()
 
 if(STRATA_ENABLE_CUDA)
-  # Local builds target the visible GPU(s); portable releases/cross builds pass an
-  # explicit list, e.g. -DCMAKE_CUDA_ARCHITECTURES="86;89;120" with a suitable toolkit.
-  # Set this BEFORE enable_language, which otherwise supplies a compiler default.
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    if(DEFINED ENV{CUDAARCHS} AND NOT "$ENV{CUDAARCHS}" STREQUAL "")
-      set(CMAKE_CUDA_ARCHITECTURES "$ENV{CUDAARCHS}" CACHE STRING "CUDA architectures")
-    else()
-      set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures")
-    endif()
-  endif()
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  endif()
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Plan v0.3 P6: developed and measured on sm_120 (RTX 50); the kernels need sm_80 or newer (tf32 mma in
@@ -71,7 +56,7 @@ if(STRATA_ENABLE_CUDA)
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 80)
+    if(_base LESS 80 AND NOT STRATA_EXPERIMENTAL_SM75)   # the A/B of a Turing card as a layer-split stage
       message(FATAL_ERROR
         "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
@@ -115,6 +100,12 @@ add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
+if(STRATA_BUILD_TESTS)
+  # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
+  add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
+  target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
+  add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+endif()
 
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
@@ -125,14 +116,10 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
-if(STRATA_BUILD_PORTABLE_TESTS)
-  add_executable(expert_placement_test src/plan/expert_placement_test.cpp)
-  target_link_libraries(expert_placement_test PRIVATE strata_plan)
-  add_test(NAME expert_placement COMMAND expert_placement_test)
-endif()
 
 # ---- strata_core (CUDA, Phase 2) ------------------------------------------
-# Only built when CUDA is on; artifact and planning tools do not need a toolkit.
+# Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit.  The arch
+# guard above has already refused anything but sm_120 by the time this runs.
 if(STRATA_ENABLE_CUDA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
@@ -208,6 +195,7 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
+                          src/kernels/cuda/qsa_prompt_attn.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
@@ -217,6 +205,13 @@ if(STRATA_ENABLE_CUDA)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
+  # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON
+  if(STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN)
+    add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
+    target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
+  endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
@@ -264,16 +259,10 @@ if(STRATA_ENABLE_CUDA)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
-    src/core/expert_cache.cpp src/core/multi_gpu.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
-  if(STRATA_BUILD_MULTI_GPU_TESTS)
-    add_executable(multi_gpu_test src/core/multi_gpu_test.cpp)
-    target_link_libraries(multi_gpu_test PRIVATE strata_engine CUDA::cudart)
-    add_test(NAME multi_gpu_experts COMMAND multi_gpu_test)
-    set_tests_properties(multi_gpu_experts PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-  endif()
 
   # `strata generate` (P2.S6).  The FIRST user-facing program: everything under it is a component, and this is
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
@@ -537,7 +526,6 @@ if(STRATA_NATIVE_EXPERTS)
       GIT_SHALLOW FALSE
       SOURCE_SUBDIR ggml)
     # The one-argument FetchContent_Populate form is rejected by newer CMake.
-    # Populate only ggml, not llama.cpp's complete build, on CMake 3.24 and newer.
     FetchContent_MakeAvailable(strata_llamacpp)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
@@ -595,8 +583,10 @@ if(STRATA_BUILD_TESTS)
   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # plan v0.3 P5: the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the 38 GB model; run it by hand or from tools/gpu_session.py)
-  add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
-  target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact CUDA::cudart)
+  if(STRATA_ENABLE_CUDA)   # #93: it needs the device dequantizers and cudart (a CPU-only configure has neither)
+    add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
+    target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact CUDA::cudart)
+  endif()
 
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
@@ -613,18 +603,15 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(pool_test PRIVATE strata_kernels_cpu)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   # issue #29: tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
-endif()
-
-# The pool race is most visible when almost every expert is served by a GPU.
-# Keep its model-free stress test available without the omitted legacy test suite.
-if(STRATA_BUILD_TESTS OR STRATA_BUILD_MULTI_GPU_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
-  set_tests_properties(pool_stress PROPERTIES TIMEOUT 90)
 endif()
 
 if(STRATA_BUILD_TESTS)
   enable_testing()
-  add_subdirectory(tests)
+  # the unit tests above build from src/; the tests/ tree (model-level checks) is not part of the published repo
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
+    add_subdirectory(tests)
+  endif()
 endif()

@@ -1,0 +1,7 @@
+# Fork sync: upstream v0.1.24
+
+This fork now uses upstream Strata's **layer-split multi-GPU engine** (`docs/MULTI_GPU.md`) and its setup and monitoring paths. The earlier fork-only `--devices` adaptive expert-cache implementation has been retired: it was not hardware-validated, and combining it with upstream's independently developed layer split and helper-GPU caches would give two conflicting owners for the same experts. The old implementation and its tests remain in Git history (`cebd414`), but are not built or shipped in this tree.
+
+The upstream `--gpus 0,2` option uses **nvidia-smi physical GPU numbers**, not the old `--devices 0,1` CUDA-visible ordinals. Do not translate those numbers by hand, especially if `CUDA_VISIBLE_DEVICES` was set. For an existing fork installation, close the server and re-run setup with `--setup --gpus <physical-indices>` (or let setup offer the supported cards). If an old `strata-*.json` still contains `--devices`, regenerate that config; the v0.1.24 engine does not accept the old flag. Model files in `Strata-data` are reusable.
+
+Upstream's layer split, its separate experimental helper caches (`docs/SECOND_GPU.md`), prefill, setup and telemetry take precedence. We retain only a few independent fork fixes: CMake compatibility with modern `FetchContent`, a valid position-zero native prompt in the CLI, and cleanup of a device-owned CUDA arena even if another GPU is current. CUDA execution and multi-GPU performance still need validation on a machine with NVIDIA hardware; the host-only tests cannot establish that.

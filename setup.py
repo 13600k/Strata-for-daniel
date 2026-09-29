@@ -29,16 +29,14 @@ engine), --check (only check this PC).
 from __future__ import annotations
 
 import argparse
-import csv
 import ctypes
 import hashlib
-import io
 import json
-import math
 import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -60,7 +58,7 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
-MIN_ENGINE = (0, 1, 20)                # v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
+MIN_ENGINE = (0, 1, 24)                # v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 
 MODELS = {
@@ -261,136 +259,6 @@ def _cpuid_avx512_full() -> bool:
         return False
 
 
-# nvidia-smi's indices are NOT necessarily CUDA ordinals (CUDA defaults to FASTEST_FIRST).
-# Probe the driver in a fresh process so CUDA_VISIBLE_DEVICES / CUDA_DEVICE_ORDER are applied exactly as
-# they will be for the engine. No CUDA toolkit or third-party Python package is needed.
-_CUDA_UUID_PROBE = '''
-import ctypes, json, os, uuid
-cuda = ctypes.WinDLL("nvcuda.dll") if os.name == "nt" else ctypes.CDLL("libcuda.so.1")
-def check(code):
-    if code:
-        raise RuntimeError("CUDA driver error %d" % code)
-check(cuda.cuInit(0))
-count = ctypes.c_int()
-check(cuda.cuDeviceGetCount(ctypes.byref(count)))
-get_uuid = getattr(cuda, "cuDeviceGetUuid_v2", None) or cuda.cuDeviceGetUuid
-uuids = []
-for ordinal in range(count.value):
-    device = ctypes.c_int()
-    check(cuda.cuDeviceGet(ctypes.byref(device), ordinal))
-    value = (ctypes.c_ubyte * 16)()
-    check(get_uuid(ctypes.byref(value), device))
-    uuids.append("GPU-" + str(uuid.UUID(bytes=bytes(value))))
-print(json.dumps(uuids))
-'''
-_GPU_UUID = r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
-
-
-def physical_gpu_infos():
-    """All nvidia-smi devices, retaining their physical index only for display/diagnostics."""
-    s = out(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,compute_cap,driver_version",
-             "--format=csv,noheader,nounits"])
-    if not s.strip():
-        return []
-    gpus = []
-    try:
-        for row in csv.reader(io.StringIO(s), skipinitialspace=True):
-            if not row:
-                continue
-            index, uid, name, mem, cc, drv = [x.strip() for x in row]
-            memory = float(mem)
-            if not (re.fullmatch(r"[0-9]+", index) and re.fullmatch(_GPU_UUID, uid) and name and
-                    math.isfinite(memory) and memory > 0 and re.fullmatch(r"[0-9]+\.[0-9]", cc) and
-                    re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", drv)):
-                raise ValueError("invalid GPU fields")
-            gpus.append({"index": int(index), "uuid": uid, "name": name, "vram_gb": memory / 1024.0,
-                         "arch": cc.replace(".", ""), "driver": drv})
-        if len({g["index"] for g in gpus}) != len(gpus) or len({g["uuid"].lower() for g in gpus}) != len(gpus):
-            raise ValueError("duplicate GPU index or UUID")
-    except ValueError as e:
-        raise ValueError(f"cannot read NVIDIA GPU information from nvidia-smi: {e}") from e
-    return gpus
-
-
-def cuda_visible_uuids():
-    """UUIDs in actual CUDA-visible ordinal order, never inferred from nvidia-smi's order."""
-    try:
-        result = subprocess.run([sys.executable, "-c", _CUDA_UUID_PROBE], capture_output=True, text=True,
-                                timeout=60, check=True)
-        uuids = json.loads(result.stdout)
-        if not isinstance(uuids, list) or any(not isinstance(u, str) or not re.fullmatch(_GPU_UUID, u) for u in uuids):
-            raise ValueError("invalid CUDA UUID response")
-        if len(set(u.lower() for u in uuids)) != len(uuids):
-            raise ValueError("duplicate CUDA UUIDs")
-        return uuids
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
-        raise ValueError("cannot verify CUDA-visible GPU ordinals through the NVIDIA driver; check the driver and "
-                         "CUDA_VISIBLE_DEVICES (refusing to guess from nvidia-smi indices)") from e
-
-
-def gpu_infos():
-    """Visible GPUs in CUDA order, with the original gpu_info fields plus device, index and uuid."""
-    physical = physical_gpu_infos()
-    if not physical:
-        return []
-    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
-    tokens = None
-    if mask is not None:
-        if mask.strip() in ("", "-1"):
-            return []
-        tokens = mask.split(",")
-        # CUDA silently ignores a suffix after an invalid entry. Reject that instead of selecting the wrong GPUs.
-        for token in tokens:
-            if re.fullmatch(r"[0-9]+", token):
-                continue
-            if re.fullmatch(r"GPU-[0-9a-fA-F-]+", token):
-                matches = [g for g in physical if g["uuid"].startswith(token)]
-                if len(matches) == 1:
-                    continue
-            raise ValueError(f"invalid, ambiguous or unsupported CUDA_VISIBLE_DEVICES entry: {token!r}; "
-                             "use CUDA ordinals or unique GPU UUIDs (MIG is not supported by setup)")
-    uuids = cuda_visible_uuids()
-    if tokens is not None and len(tokens) != len(uuids):
-        raise ValueError("CUDA_VISIBLE_DEVICES does not resolve to the requested number of GPUs; "
-                         "check for invalid or duplicate entries")
-    by_uuid = {g["uuid"].lower(): g for g in physical}
-    visible = []
-    for device, uid in enumerate(uuids):
-        if uid.lower() not in by_uuid:
-            raise ValueError(f"CUDA device {device} ({uid}) cannot be matched to nvidia-smi; "
-                             "MIG or an inconsistent device mapping is not supported by setup")
-        if tokens is not None and tokens[device].startswith("GPU-") and not uid.startswith(tokens[device]):
-            raise ValueError("CUDA_VISIBLE_DEVICES UUID order disagrees with the NVIDIA driver")
-        visible.append(dict(by_uuid[uid.lower()], device=device))
-    return visible
-
-
-def device_list(value):
-    """argparse type: a canonical, ordered list of distinct CUDA-visible ordinals."""
-    parts = value.split(",")
-    if not parts or any(not re.fullmatch(r"[0-9]+", p.strip()) for p in parts):
-        raise argparse.ArgumentTypeError("devices must be comma-separated nonnegative CUDA ordinals, e.g. 0,1")
-    devices = [int(p) for p in parts]
-    if any(d > 2147483647 for d in devices) or len(set(devices)) != len(devices):
-        raise argparse.ArgumentTypeError("devices must be distinct CUDA ordinals in the range 0..2147483647")
-    return ",".join(map(str, devices))
-
-
-def nonnegative_int(value):
-    if not re.fullmatch(r"[0-9]+", value) or int(value) > 2147483647:
-        raise argparse.ArgumentTypeError("must be an integer in the range 0..2147483647")
-    return int(value)
-
-
-def select_gpus(gpus, devices):
-    selected = [int(d) for d in (devices or "0").split(",")]
-    for device in selected:
-        if device >= len(gpus):
-            raise ValueError(f"CUDA device {device} is unavailable: {len(gpus)} GPU(s) visible; "
-                             "--devices uses ordinals after CUDA_VISIBLE_DEVICES filtering/reordering")
-    return [gpus[d] for d in selected]
-
-
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
     s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
@@ -407,6 +275,162 @@ def gpus():
 
 
 GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
+SPLIT_MIN_VRAM_GB = 8                                   # a card sharing a model holds the dense weights and its own
+                                                        # prompt buffers too (docs/MULTI_GPU.md)
+
+
+def cc(g) -> str:
+    return f"{g['arch'][:-1]}.{g['arch'][-1]}"
+
+
+def gpu_problem(g, together=False):
+    """Why Strata cannot use this card, in plain words (None: it can)."""
+    if int(g["arch"]) < 80:
+        return (f"not supported - older than the RTX 30 series (compute capability {cc(g)}; Strata needs 8.0 or "
+                "newer)")
+    if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
+        return (f"not supported together with other GPUs - {g['vram_gb']:.0f} GB of VRAM (a card sharing the model "
+                f"needs {SPLIT_MIN_VRAM_GB} GB or more)")
+    return None
+
+
+def gpu_rank(g):
+    """The order cards share a model in: the newest generation first (it gets the first layers and most of the
+    work), then the most VRAM."""
+    return (-int(g["arch"]), -round(g["vram_gb"]), g["index"])
+
+
+def gpu_name(g) -> str:
+    return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB)"
+
+
+def gpu_table(found) -> None:
+    say("  Your NVIDIA GPUs:")
+    for g in found:
+        p = gpu_problem(g)
+        say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + ("can be used" if p is None else p))
+
+
+def together_ok(found) -> list:
+    """The cards that can share one model, in the order they would (empty if fewer than two)."""
+    ok_ = sorted([g for g in found if gpu_problem(g, together=True) is None], key=gpu_rank)
+    return ok_ if len(ok_) >= 2 else []
+
+
+def parse_gpus(text, found) -> list:
+    """--gpus / --gpu with several: "0,2" or "all" (every card that can share the model)."""
+    if str(text).strip().lower() == "all":
+        sel = [g["index"] for g in together_ok(found)]
+        if not sel:
+            gpu_table(found)
+            fail("--gpus all: this PC does not have two GPUs Strata can use together")
+        return sel
+    try:
+        sel = [int(x) for x in str(text).split(",") if x.strip()]
+    except ValueError:
+        fail(f"--gpus takes GPU numbers as nvidia-smi numbers them, e.g. --gpus 0,2 (or --gpus all), not {text!r}")
+    if len(sel) < 2 or len(set(sel)) != len(sel):
+        fail("--gpus takes two or more different GPUs, e.g. --gpus 0,2 (one GPU: --gpu 0)")
+    return sel
+
+
+def check_gpus(sel, found, what="") -> None:
+    """Stops with a plain message when a chosen card is missing or cannot be used, and says what can."""
+    together = len(sel) > 1
+    for i in sel:
+        g = next((x for x in found if x["index"] == i), None)
+        p = "not found on this PC" if g is None else gpu_problem(g, together)
+        if p is None:
+            continue
+        say()
+        gpu_table(found)
+        can = together_ok(found)
+        single = [x for x in found if gpu_problem(x) is None]
+        ones = " or ".join(f"--gpu {x['index']}" for x in single)
+        both = "--gpus " + ",".join(str(x["index"]) for x in can) if can else ""
+        hint = ((f"use these together: {both}" + (f" (or one card: {ones})" if not together else "")) if can else
+                f"use one card: {ones}" if single else "Strata needs an NVIDIA RTX 30 series or newer card")
+        fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
+
+
+def engine_archs():
+    """The GPU generations the installed engine has code for: (archs, ptx), or None when there is none."""
+    info = ROOT / "engine" / "BUILD.json"
+    try:
+        meta = json.loads(info.read_text())
+    except (OSError, ValueError):
+        return None
+    return [int(x) for x in meta.get("archs", [])], bool(meta.get("ptx"))
+
+
+def engine_runs_on(g) -> bool:
+    ea = engine_archs()
+    if ea is None or not ea[0]:
+        return True
+    archs, ptx = ea
+    return int(g["arch"]) in archs or (ptx and int(g["arch"]) > max(archs))
+
+
+def choose_gpus(a, found) -> list:
+    """Which cards this install uses: --gpus / --gpu, or asked when two or more can share the model (the two best
+    together recommended), else the supported card with the most VRAM.  Returns their numbers, the main one first."""
+    if a.gpus:
+        sel = parse_gpus(a.gpus, found)
+        check_gpus(sel, found)
+        return sel
+    if a.gpu is not None:
+        check_gpus([a.gpu], found)
+        return [a.gpu]
+    single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
+    if not single:
+        gpu_table(found)
+        fail("none of your GPUs can run Strata", "it needs an NVIDIA RTX 30 series or newer (compute capability 8.0+)")
+    can = together_ok(found)
+    if not can:
+        return [single[0]["index"]]
+    say()
+    say(f"  Strata can run the model on one GPU, or share it across {'these' if len(can) > 2 else 'both'}: then each"
+        " card holds the")
+    say("  experts of its own layers, so together they hold about twice as many, and prompts are read about 20%")
+    say("  faster (details: docs/MULTI_GPU.md). A much slower extra card can also make it slower.")
+    opts = [can[:2]] + ([can] if len(can) > 2 else []) + [[g] for g in single]
+    for i, o in enumerate(opts, 1):
+        label = (" + ".join(gpu_name(g) for g in o) + " together") if len(o) > 1 else gpu_name(o[0]) + " only"
+        say(f"  {i}) {label}" + ("   (recommended)" if i == 1 else ""))
+    for g in found:
+        if gpu_problem(g, together=True) is not None:
+            say(f"     (GPU {g['index']}, {g['name']}: {gpu_problem(g, together=True)})")
+    pick = opts[int(ask("Which GPUs?", [str(i) for i in range(1, len(opts) + 1)], "1", a.yes or a.check)) - 1]
+    return [g["index"] for g in pick]
+
+
+def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+    """Starting a model set up for one card on a PC with two or more that can share it: asked once (the answer is
+    saved in its config)."""
+    if isinstance(cfg.get("gpu"), list) or cfg.get("gpus_asked"):
+        return cfg
+    found = gpus()
+    can = together_ok(found)
+    if not can:
+        return cfg
+    pair = can[:2]
+    cfg["gpus_asked"] = True
+    say()
+    say("  This PC has " + " and ".join(gpu_name(g) for g in pair) + ": Strata can share the model across both.")
+    say("  Together they hold about twice the model's experts and read prompts about 20% faster (docs/MULTI_GPU.md).")
+    missing = [g for g in pair if not engine_runs_on(g)]
+    if missing:
+        say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
+            "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
+    elif ask("  Use both from now on? (you can change it later: START-HERE.bat --gpu N for one card)",
+             ["y", "n"], "y", yes) == "y":
+        cfg["gpu"] = [g["index"] for g in pair]
+        cfg["layer_split"] = cfg.get("layer_split") or "auto"
+        ok("from now on this model runs on " + " + ".join(gpu_name(g) for g in pair))
+    else:
+        ok("staying on one GPU (START-HERE.bat --gpus " + ",".join(str(g["index"]) for g in pair) + " switches)")
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    return cfg
 
 
 def gpu_info(pick=None):
@@ -449,7 +473,9 @@ def find_vcvars():
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
-    p = out([str(vswhere), "-latest", "-products", "*", "-requires",
+    # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
+    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none
+    p = out([str(vswhere), "-latest", "-products", "*", "-version", "[16.0,18.0)", "-requires",
              "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
@@ -533,10 +559,32 @@ def download(url, dst: Path, what=None):
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
     if total and part.stat().st_size != total:
-        fail(f"could not finish downloading {dst.name}", "check your internet connection and run it again")
+        fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, the server says {total:,}",
+             "check your internet connection and run it again (the download resumes where it stopped)")
     part.replace(dst)
     mark(dst)
     ok(f"{what or dst.name} downloaded")
+
+
+def check_shards(shards):
+    """Every shard present and whole, or setup stops naming the file and the numbers.  Whole means as long as
+    its own tensor directory says (the header is read, the data is not): a truncated copy (--gguf-dir, a .part
+    renamed by hand, a download finished by an older setup) otherwise passes as a model file and the engine
+    fails much later, at the first tensor that runs past the end."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    for s in shards:
+        if not s.exists():
+            fail(f"missing {s}")
+        try:
+            g = GGUFFile(s)
+        except (ValueError, struct.error) as e:
+            fail(f"{s.name} is not a whole GGUF shard ({e})", "delete it and run setup again")
+        need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+        have = s.stat().st_size
+        if have < need:
+            fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",
+                 "delete it and run setup again (or copy the whole file into --gguf-dir)")
 
 
 def get_llama_cpp():
@@ -612,19 +660,7 @@ def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
         meta = json.loads(info.read_text())
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
         if meta.get("source") == "local" or ver >= MIN_ENGINE:
-            if meta.get("source") == "local" and (meta.get("src") != source_hash(ENGINE_SOURCES) or
-                    (vision != "none" and meta.get("vision_src") != source_hash(VISION_SOURCES))):
-                return None   # selected model/settings must not silently reuse an outdated source build
-            archs = [int(a) for a in meta.get("archs", [])]
-            arch = int(gpu["arch"])
-            if arch not in archs and not (archs and meta.get("ptx") and arch > max(archs)):
-                warn(f"the installed engine does not cover CUDA architecture {arch}: compiling instead")
-                return None
-            if vision != "none" and not (eng / VEXE).exists():
-                return None
-            if vision == "gpu" and meta.get("source") == "local" and meta.get("vision") != "gpu":
-                return None
-            ok("engine already installed")
+            ok("ready-made engine already installed")
             return eng
         say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
         info.unlink()
@@ -657,9 +693,11 @@ def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
         shutil.rmtree(tmp, ignore_errors=True)
         return None
     archs = [int(a) for a in meta.get("archs", [])]
-    arch = int(gpu["arch"])
-    if arch not in archs and not (archs and meta.get("ptx") and arch > max(archs)):
-        warn(f"the ready-made engine is built for {', '.join(str(a) for a in archs)}; your GPU is {arch}" + ("" if updating else ": compiling instead"))
+    miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
+            if int(x) not in archs and not (meta.get("ptx") and int(x) > max(archs))]
+    if miss:
+        warn(f"the ready-made engine is built for {', '.join(str(a) for a in archs)}; your GPU is "
+             f"{', '.join(str(x) for x in miss)}" + ("" if updating else ": compiling instead"))
         shutil.rmtree(tmp, ignore_errors=True)
         return None
     for p in tmp.iterdir():
@@ -708,20 +746,13 @@ def update_installed_engine(url_base) -> None:
     except OSError:
         warn(f"engine {meta.get('version') or ''} is in use: close the model window and run this again to update it")
         return
-    try:
-        gpu = gpu_info()
-    except ValueError as e:
-        warn(f"cannot check an engine update ({e}); keeping the installed engine")
-        return
+    gpu = gpu_info()
     if local:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
                 raise RuntimeError("no NVIDIA GPU found")
-            # A plain restart must not replace a multi-architecture binary with one
-            # targeting only visible device zero. Keep every architecture built before.
-            archs = list(dict.fromkeys([*meta.get("archs", []), int(gpu["arch"])]))
-            targets = [dict(gpu, arch=str(a)) for a in archs]
-            build_engine(gpu, vision, False, get_llama_cpp(), gpus=targets)
+            gpu = {**gpu, "archs": sorted({int(gpu["arch"]), *(int(x) for x in meta.get("archs", []))})}
+            build_engine(gpu, vision, False, get_llama_cpp())
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
         return
@@ -742,7 +773,7 @@ def update_installed_engine(url_base) -> None:
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
     nvcc, cuda_v = find_nvcc()
-    need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
+    need_cuda = (12, 8) if max(int(x) for x in gpu.get("archs", [gpu["arch"]])) >= 120 else (12, 0)
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
@@ -838,48 +869,42 @@ def source_hash(parts) -> str:
     return h.hexdigest()[:16]
 
 
-def build_engine(gpu, vision, yes, llama, *, gpus=None, force=False) -> Path:
-    """Compile for every selected and previously locally built architecture, reusing up-to-date source builds.
-    Setup owns separate build trees so manual CMake architecture choices are left untouched."""
-    gpus = gpus or [gpu]
+def build_engine(gpu, vision, yes, llama) -> Path:
+    """Compile the engine (and, for images, the encoder) for this GPU; the results go to engine/.  A compiled
+    engine whose source files changed since (a `git pull`) is compiled again: only the changed files, a few minutes."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
-    previous = [int(a) for a in meta.get("archs", [])] if meta.get("source") == "local" else []
-    archs = list(dict.fromkeys([*previous, *(int(g["arch"]) for g in gpus)]))
-    architectures = ";".join(map(str, archs))
     want_vision = vision != "none"
+    local = meta.get("source") == "local"
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
-    compatible = meta.get("source") == "local" and set(archs) <= set(previous)
-    rebuild = force or not compatible or not (eng / EXE).exists() or meta.get("src") != src
-    rebuild_vision = want_vision and (force or not compatible or meta.get("vision") != vision or
-                                     not (eng / VEXE).exists() or meta.get("vision_src") != vsrc)
-    if not rebuild and not rebuild_vision:
+    engine_ok = local and (eng / EXE).exists() and meta.get("src") == src
+    vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
+    if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
-    # Include previously built architectures when deciding the minimum toolkit too.
-    newest = max(gpus, key=lambda g: int(g["arch"]))
-    toolkit_gpu = newest if int(newest["arch"]) == max(archs) else dict(newest, arch=str(max(archs)))
-    nvcc, vcvars = install_build_tools(toolkit_gpu, yes)
-    # Setup owns these build trees; do not overwrite a user's manually configured build/CMakeCache.txt.
-    bdir, vdir = ROOT / "build-setup", ROOT / "build-vision-setup"
-    if rebuild:
-        say(f"  Compiling the Strata engine for CUDA architectures {architectures} ...")
-        cmake_build(ROOT, bdir, "strata",
-                    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={architectures}",
+    nvcc, vcvars = install_build_tools(gpu, yes)
+    archs = sorted({int(x) for x in gpu.get("archs", [gpu["arch"]])})    # every card the model runs on
+    cuda_archs = ";".join(str(x) for x in archs)
+    if not engine_ok:
+        say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
+            if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
+        cmake_build(ROOT, ROOT / "build", "strata",
+                    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
-        shutil.copy2(bdir / EXE, eng / EXE)
-    if rebuild_vision:
+        shutil.copy2(ROOT / "build" / EXE, eng / EXE)
+    if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
         defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
         if vision == "gpu":
-            defs += [f"-DCMAKE_CUDA_ARCHITECTURES={architectures}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
-        cmake_build(ROOT / "tools" / "vision", vdir, "strata-vision", defs, vcvars, "build-vision.bat")
-        shutil.copy2(vdir / "bin" / VEXE, eng / VEXE)
+            defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+        cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision", defs, vcvars, "build-vision.bat")
+        shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
-    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs, "vision": vision,
+    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
+                                 "vision": vision,
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
@@ -1071,27 +1096,8 @@ def choices_from_config(cfg_path: Path) -> dict:
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
-            "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"),
-            "gpu": cfg.get("gpu") if val("--devices") is None else None,
-            "devices": val("--devices"),
-            "expert_vram_mib": int(val("--expert-vram-mib")) if val("--expert-vram-mib") is not None else None,
-            "expert_reserve_mib": int(val("--expert-reserve-mib")) if val("--expert-reserve-mib") is not None else None,
-            "kv_resident": int(val("--kv-resident")) if val("--kv-resident") is not None else None,
-            "allow_high_context": cfg.get("allow_high_context", model in ("IQ3_XXS", "IQ3_S") and
-                                           int(val("--max-context") or 0) > 131072)}
-
-
-def inherit_gpu_choices(a, ch):
-    """Retain extension settings across copies; an explicit physical or CUDA-visible selection wins, never both."""
-    if a.devices is None and a.gpu is None:
-        a.devices, a.gpu = ch.get("devices"), ch.get("gpu")
-    if a.devices is not None:
-        a.devices = device_list(a.devices)
-        a.gpu = None
-    for key in ("expert_vram_mib", "expert_reserve_mib", "kv_resident"):
-        if getattr(a, key) is None:
-            setattr(a, key, ch.get(key))
-    a.allow_high_context = a.allow_high_context or ch.get("allow_high_context", False)
+            "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
+            "layer_split": cfg.get("layer_split")}
 
 
 def find_in(roots: list, rel: str):
@@ -1138,20 +1144,13 @@ def is_wsl() -> bool:
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
+    sel = cfg.get("gpu")
+    gl = [gpu_info(i) or {} for i in sel] if isinstance(sel, list) else [gpu_info(sel) or {}]
+    g = {"name": " + ".join(x.get("name", "?") for x in gl), "vram_gb": sum(x.get("vram_gb", 0) for x in gl)}
     a = cfg.get("args", [])
-    selection = ""
-    if "--devices" in a:
-        selected = select_gpus(gpu_infos(), a[a.index("--devices") + 1])
-        g = selected[0]
-        selection = "|devices=" + ",".join(x["uuid"] for x in selected)
-        for flag in ("--expert-vram-mib", "--expert-reserve-mib", "--kv-resident"):
-            if flag in a:
-                selection += f"|{flag}={a[a.index(flag) + 1]}"
-    else:
-        g = gpu_info(cfg.get("gpu")) or {}
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
     return "|".join([g.get("name", "?"), f"{g.get('vram_gb', 0):.0f}GB", cpu_info()[0], f"{ram_gb():.0f}GB",
-                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"]) + selection
+                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
 
 
 def calibrate_config(cfg_path: Path) -> bool:
@@ -1159,7 +1158,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     config and remember them per PC and model in the settings file, so an update or a reinstall keeps them."""
     sys.path.insert(0, str(ROOT / "tools"))
     import calibrate as CAL
-    cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     say()
     say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  draft depth, the CPU threads). It takes about 5-10 minutes; the PC is busy meanwhile.")
@@ -1194,9 +1193,6 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     KV streaming is dropped: its RAM copy must be pinned, and the driver pins only about 1 GB there."""
     a = cfg.get("args", [])
     changed = False
-    if "--devices" in a and "gpu" in cfg:
-        del cfg["gpu"]                                 # CUDA-visible multi selection cannot use a physical mask
-        changed = True
     ver = engine_version(cfg["exe"]) if "--prefill" in a else (0, 0, 0)
     if "--prefill" in a and a[a.index("--prefill") + 1] == "2048" and ver >= (0, 1, 13):
         a[a.index("--prefill") + 1] = "auto"
@@ -1216,7 +1212,8 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
-def start(cfg_path: Path, port: int | None, gpu: int | None = None, open_browser=True) -> int:
+def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
+          layer_split=None) -> int:
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
@@ -1224,11 +1221,28 @@ def start(cfg_path: Path, port: int | None, gpu: int | None = None, open_browser
     cfg_path.touch()                                     # the most recently used model
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
-    if gpu is not None:
-        if "--devices" in cfg["args"]:
-            fail("--gpu cannot override a config with --devices", "run setup --setup --gpu N to select one physical GPU")
-        gpu_info(gpu)                                  # stops with the list of GPUs if there is no such one
+    found = gpus()
+    if isinstance(gpu, list):                          # --gpus: saved, this model runs on these cards from now on
+        check_gpus(gpu, found)
+        cfg["gpu"], cfg["gpus_asked"] = gpu, True
+        cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        gpu = None
+    elif gpu is not None:                              # --gpu N: this start only, on that card
+        check_gpus([gpu], found)
         cmd += ["--gpu", str(gpu)]
+    else:
+        cfg = offer_together(cfg_path, cfg, yes)
+    use = gpu if gpu is not None else cfg.get("gpu")
+    if isinstance(use, list):
+        check_gpus(use, found, "(chosen for this model) ")
+        byid = {g["index"]: g for g in found}
+        ok("GPUs: " + " + ".join(gpu_name(byid[i]) for i in use) + f" together (layers split {cfg.get('layer_split') or 'auto'})")
+    elif found:
+        g = next((x for x in found if x["index"] == use), None) if use is not None else max(
+            found, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+        if g is not None:
+            ok("GPU: " + gpu_name(g))
     if open_browser:
         cmd.append("--open")
     gb = 0.0
@@ -1263,45 +1277,28 @@ def write_run_script(model, cfg_path, port):
     return script
 
 
-def context_limit(model, ram, ctx, allow_high_context=False):
-    if model in ("IQ3_XXS", "IQ3_S") and ram < 90 and ctx > 131072:
-        risk = f"{model} with {ctx} context tokens on {ram:.0f} GB RAM can exhaust memory or cause heavy swapping"
-        if allow_high_context:
-            warn(risk + "; --allow-high-context keeps your requested context at your own risk")
-        else:
-            warn(risk + ": using 128K (pass --allow-high-context to keep the requested context)")
-            return 131072
-    return ctx
-
-
 # ------------------------------------------------------------------------------------------------ main
-def argument_parser():
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--kv", choices=["int8", "q4_0"],
-                    help="KV cache precision above 8K context: int8 (default) or q4_0 (half the memory, less precise)")
-    ap.add_argument("--kv-resident", type=nonnegative_int, default=None,
-                    help="resident KV cells: 0 = all KV on primary GPU; otherwise stream the rest from RAM")
-    ap.add_argument("--allow-high-context", action="store_true",
-                    help="keep IQ3 contexts above 128K on PCs with less than 90 GB RAM (risk of OOM/swapping)")
-    selection = ap.add_mutually_exclusive_group()
-    selection.add_argument("--devices", type=device_list, default=None,
-                           help="comma-separated CUDA-visible ordinals after CUDA_VISIBLE_DEVICES filtering/reordering; "
-                                "first = primary. Mutually exclusive with physical --gpu selection.")
-    ap.add_argument("--expert-vram-mib", type=nonnegative_int, default=None,
-                    help="expert cache cap in MiB per secondary GPU (engine default: 0 = auto)")
-    ap.add_argument("--expert-reserve-mib", type=nonnegative_int, default=None,
-                    help="free-memory margin in MiB per secondary GPU (engine default: 1024)")
+                    help="KV cache precision above 8K context: int8 (default) or q4_0 (half the memory, a little less "
+                         "precise)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
     ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
-    selection.add_argument("--gpu", type=int, help="the GPU to use, numbered as nvidia-smi numbers them (default: the one with the "
-                                            "most VRAM; with --setup it is saved, when starting it overrides the saved one)")
+    ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (default: asked when several can be "
+                                  "used; with --setup it is saved, when starting it is for that start only)")
+    ap.add_argument("--gpus", help="several GPUs sharing one model, as nvidia-smi numbers them: \"0,2\", or \"all\" "
+                                   "(every card that can); the first is the main one. Saved, also when starting "
+                                   "(see docs/MULTI_GPU.md)")
+    ap.add_argument("--layer-split", help="with --gpus: where each later GPU's layers start (\"18\", \"16,32\"); "
+                                          "default auto, placed from each GPU's free VRAM")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
                                    "devices on your network (issue #26; set --api-key too)")
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0)")
@@ -1313,26 +1310,20 @@ def argument_parser():
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
     ap.add_argument("--build", action="store_true", help="compile the engine instead of using the ready-made one")
-    ap.add_argument("--prebuilt", help="where the ready-made engine is (a URL folder or a local folder)")
+    ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
+                    help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
-    return ap
-
-
-def main(argv=None) -> int:
-    ap = argument_parser()
-    a = ap.parse_args(argv)
-    if a.context is not None and a.context <= 0:
-        ap.error("--context must be positive")
-    choices = (a.setup or a.model or a.family or a.check or a.context is not None or
-               a.vision is not None or a.devices is not None or a.expert_vram_mib is not None or
-               a.expert_reserve_mib is not None or a.allow_high_context or a.build or
-               a.models_dir is not None or a.gguf_dir is not None or a.kv is not None or
-               a.kv_resident is not None or a.experimental_speed_projection is not None or
-               a.host is not None or a.api_key is not None)
-    a.prebuilt = a.prebuilt if a.prebuilt is not None else os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL)
+    a = ap.parse_args()
+    if a.gpu is not None:                              # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
+        if "," in a.gpu:
+            a.gpus, a.gpu = a.gpus or a.gpu, None
+        elif a.gpu.strip().isdigit():
+            a.gpu = int(a.gpu)
+        else:
+            ap.error(f"--gpu takes a GPU number as nvidia-smi numbers them, e.g. --gpu 1 (or --gpus 0,2), not {a.gpu!r}")
     say("Strata - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
@@ -1355,14 +1346,19 @@ def main(argv=None) -> int:
                 a.experimental_speed_projection = a.experimental_speed_projection or ch["esp"]
                 a.host, a.api_key = a.host or ch["host"], a.api_key or ch["api_key"]
                 a.port = a.port or ch["port"]
-                inherit_gpu_choices(a, ch)
+                if isinstance(ch.get("gpu"), list):     # a layer split: set up across the same cards again
+                    a.gpus = a.gpus or ",".join(str(g) for g in ch["gpu"])
+                    a.layer_split = a.layer_split or ch.get("layer_split")
+                else:
+                    a.gpu = a.gpu if a.gpu is not None else ch.get("gpu")
                 a.yes = True
-    if have and choices and not (a.model or a.family or a.check):
-        inherit_gpu_choices(a, choices_from_config(have[0]))
     global GPU_PICK
-    GPU_PICK = a.gpu
+    # starting an installed model: --gpus 0,2 (or all) saves those cards for it and starts on them (it used to start
+    # on the first one alone unless given with --setup), --gpu N runs this start on one card; neither: the saved
+    # choice, and asked once when the PC has cards that could share the model
+    run_gpu = (parse_gpus(a.gpus, gpus()) if a.gpus else None) or a.gpu
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
-    if have and a.calibrate and not choices:
+    if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
         if not a.build:
             update_installed_engine(a.prebuilt)
         pick_cfg = have[0]
@@ -1371,57 +1367,42 @@ def main(argv=None) -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
-        if a.gpu is not None and "--devices" in json.loads(pick_cfg.read_text(encoding="utf-8-sig")).get("args", []):
-            ap.error("--gpu cannot override a config with --devices; run setup --setup --gpu N first")
         calibrate_config(pick_cfg)
-        return 0 if a.no_start else start(pick_cfg, a.port, a.gpu)
-    if have and not (choices or a.no_start):
+        return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split)
+    if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         if not a.build:
             update_installed_engine(a.prebuilt)
         if len(have) == 1:
-            return start(have[0], a.port, a.gpu)
+            return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split)
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
         say(f"  {len(have) + 1}) install another model / change settings")
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
-            return start(have[pick - 1], a.port, a.gpu)
+            return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split)
 
     # ---- 1. the PC
     step(1, "checking your PC")
-    if a.devices is not None:
-        try:
-            visible = gpu_infos()                     # only explicit --devices needs the CUDA UUID probe
-            if not visible:
-                fail("no NVIDIA GPU visible (check nvidia-smi and CUDA_VISIBLE_DEVICES)")
-            selected = select_gpus(visible, a.devices)
-        except ValueError as e:
-            fail(str(e))
-        for detected in visible:
-            role = "primary" if detected is selected[0] else "expert cache" if detected in selected else "not selected"
-            ok(f"CUDA GPU {detected['device']}: {detected['name']}, {detected['vram_gb']:.1f} GB VRAM, "
-               f"sm_{detected['arch']}, driver {detected['driver']} ({role}; nvidia-smi index {detected['index']})")
-        gpu = selected[0]
-    else:
-        gpu = gpu_info()
-        if gpu is None:
-            fail("no NVIDIA GPU found (nvidia-smi did not answer)",
-                 "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
-        selected = [gpu]
-        ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
-           f"driver {gpu['driver']}")
-        if gpu["count"] > 1:
-            say(f"       {gpu['count']} NVIDIA GPUs: Strata uses GPU {gpu['index']}"
-                + (" (the one with the most VRAM)" if a.gpu is None else "") + " - choose another with --gpu N:")
-            for x in gpus():
-                say(f"         {x['index']}: {x['name']}, {x['vram_gb']:.0f} GB")
-    for selected_gpu in selected:
-        if int(selected_gpu["arch"]) < 80:
-            fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
-        if driver_major(selected_gpu) < MIN_DRIVER:
-            fail(f"the NVIDIA driver is too old ({selected_gpu['driver']}; {MIN_DRIVER} or newer is needed)",
-                 "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
+    found = gpus()
+    if not found:
+        fail("no NVIDIA GPU found (nvidia-smi did not answer)",
+             "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
+    if len(found) > 1 or gpu_problem(found[0]) is not None:
+        gpu_table(found)
+    sel = choose_gpus(a, found)                        # asked when two or more cards can share the model
+    multi = sel if len(sel) > 1 else []
+    a.gpu = sel[0]                                     # the main GPU: the checks and the sizing below are its
+    GPU_PICK = a.gpu
+    gpu = gpu_info(a.gpu)
+    chosen = [gpu_info(i) for i in sel]
+    gpu["archs"] = sorted({x["arch"] for x in chosen})  # the engine needs code for every one of them
+    if multi:
+        ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
+    ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
+    if driver_major(gpu) < MIN_DRIVER:
+        fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
+             "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
@@ -1475,11 +1456,21 @@ def main(argv=None) -> int:
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     if ram < MODELS[model]["ram_gb"] - 4:
-        fail(f"{model} needs about {MODELS[model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB",
-             "choose Q2_0 or IQ2_XS, or add RAM")
+        # #125: a warning and a question, not a stop: the user may accept paging (asked, "no" by default, so an
+        # unattended --yes install still stops here)
+        need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
+        warn(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
+             f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
+             "to be much slower, and it may not start at all.")
+        say("       A smaller size (Q2_0 or IQ2_XS) fits; more RAM fixes it.")
+        if ask("  Install it anyway?", ["y", "n"], "n", a.yes) != "y":
+            fail(f"{model} needs about {need_gb} GB of RAM; this PC has {ram:.0f} GB",
+                 "choose Q2_0 or IQ2_XS, or add RAM")
+        warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
-    rec_ctx = 32768 if gpu["vram_gb"] < 14 else 65536 if gpu["vram_gb"] < 20 else 131072
+    small = min(x["vram_gb"] for x in chosen)         # each card keeps its layers' KV of the whole context
+    rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
     if a.context:
         ctx = a.context
     else:
@@ -1489,7 +1480,10 @@ def main(argv=None) -> int:
         for i, c in enumerate(CONTEXTS, 1):
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = CONTEXTS[int(ask("Context?", [str(i) for i in range(1, 6)], str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
-    ctx = context_limit(model, ram, ctx, a.allow_high_context)
+    if model in ("IQ3_XXS", "IQ3_S") and ram < 90 and ctx > 131072:
+        warn(f"{model} with a 262K context needs more than 64 GB of RAM ({MODELS[model]['arena_gb']:.0f} GB of experts "
+             "+ the context): using 128K")
+        ctx = 131072
     ok(f"context: {ctx} tokens")
     # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
     kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
@@ -1552,19 +1546,14 @@ def main(argv=None) -> int:
     step(4, "the Strata engine")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    # Even --devices 0 needs the source CLI. Reuse only a compatible, fingerprinted local build.
-    source_required = (a.build or a.devices is not None or a.expert_vram_mib is not None or
-                       a.expert_reserve_mib is not None or len(selected) > 1)
-    if source_required:
-        say("  Device/cache selection requires a current source-built engine.")
-    eng = None if source_required else get_prebuilt(a.prebuilt, gpu, vision)
+    eng = None if a.build else get_prebuilt(a.prebuilt, gpu, vision)
     if eng is not None and json.loads((eng / "BUILD.json").read_text()).get("source") != "local":
         pip_install(CUDA_WHEELS, "NVIDIA CUDA libraries (cuBLAS, CUDA runtime; ~0.4 GB)")
         if vision != "none" and not (eng / VEXE).exists():
             warn("the ready-made engine has no image encoder: compiling it")
             eng = None
     if eng is None:
-        eng = build_engine(gpu, vision, a.yes, llama, gpus=selected, force=a.build)
+        eng = build_engine(gpu, vision, a.yes, llama)
     meta = json.loads((eng / "BUILD.json").read_text())
     lib_dirs = meta.get("cuda_dirs") or cuda_lib_dirs()
     ok(f"engine: {eng / EXE}")
@@ -1587,9 +1576,7 @@ def main(argv=None) -> int:
                 except OSError:
                     pass
             download(fam["hf"].format(q=model) + s.name, s)
-    for s in shards:
-        if not s.exists():
-            fail(f"missing {s}")
+    check_shards(shards)
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():
@@ -1644,12 +1631,6 @@ def main(argv=None) -> int:
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
-    if a.devices is not None:
-        args += ["--devices", a.devices]
-    if a.expert_vram_mib is not None:
-        args += ["--expert-vram-mib", str(a.expert_vram_mib)]
-    if a.expert_reserve_mib is not None:
-        args += ["--expert-reserve-mib", str(a.expert_reserve_mib)]
     if ctx > 8192:
         args += ["--kv", kv]
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
@@ -1657,21 +1638,11 @@ def main(argv=None) -> int:
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 7.5 KB with 4-bit, so only when it fits.
     kv_ram_gb = ctx * (13 * (576 if kv == "q4_0" else 1056)) / 1e9   # 12 QSA layers + the draft layer
     # the RAM copy must be pinned, and under WSL the NVIDIA driver pins only about 1 GB in all
-    if is_wsl() and (ctx >= 65536 or a.kv_resident is not None):
+    if is_wsl() and ctx >= 65536:
         ok("WSL: KV streaming off (the driver pins only about 1 GB of RAM); the KV cache stays in VRAM")
-    elif a.kv_resident is not None:
-        if a.kv_resident > 0 and kv == "fp16":
-            fail("KV streaming requires an int8 or q4_0 KV cache and context above 8K")
-        args += ["--kv-resident", str(a.kv_resident)]
-        if a.kv_resident > 0:
-            warn(f"explicit KV streaming: allow about {kv_ram_gb:.1f} GB additional host RAM")
-    elif len(selected) == 1 and ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1:
+    elif ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1:
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
-    elif len(selected) > 1:
-        # Multi-GPU expert capacity already reduces VRAM pressure. Do not implicitly
-        # spend scarce host RAM on a second KV backing store (especially IQ3 on 64 GB).
-        ok("KV stays on the primary GPU; --kv-resident can explicitly enable RAM streaming")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if esp is not None:
@@ -1681,10 +1652,13 @@ def main(argv=None) -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
-    if a.devices is None and (gpu["count"] > 1 or a.gpu is not None):
+    if gpu["count"] > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
-    if a.allow_high_context:
-        cfg["allow_high_context"] = True
+        cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start
+    if multi:                                          # a layer split across these cards (the server adds the flag)
+        cfg["gpu"] = multi
+        cfg["layer_split"] = a.layer_split or "auto"
+        ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
@@ -1692,9 +1666,6 @@ def main(argv=None) -> int:
     if vision != "none":
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(shards[0]),
                          "gpu": vision == "gpu", "max_tokens": VISION[vision]["max_tokens"]}
-        if vision == "gpu" and a.devices is not None:
-            # Only the vision subprocess is remapped; engine --devices stays in the inherited CUDA ordinal space.
-            cfg["vision"]["gpu_uuid"] = gpu["uuid"]
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     cfg_path = ROOT / f"strata-{tag.lower()}.json"

@@ -104,10 +104,6 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (cudaGetDevice(&ordinal_) != cudaSuccess) {
-        err = "ExpertCache: cannot determine owning device";
-        return false;
-    }
     if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
         char buf[256];
@@ -165,13 +161,9 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 void ExpertCache::close() {
     off_.clear();
     if (base_ != nullptr) {
-        int previous = -1;
-        (void) cudaGetDevice(&previous);
-        if (cudaSetDevice(ordinal_) == cudaSuccess) (void) cudaFree(base_);
-        if (previous >= 0) (void) cudaSetDevice(previous);
+        cudaFree(base_);
         base_ = nullptr;
     }
-    ordinal_ = -1;
     residency_.clear();
     slots_ = 0;
     n_layers_ = 0;
@@ -270,6 +262,32 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         return false;
     }
     ++fills_;
+    return true;
+}
+
+bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    uint8_t* dst = device_slot(slot);
+    if (dst == nullptr || host_blob == nullptr) {
+        err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
+                             : "ExpertCache::fill_slot_queued: the host blob is null";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
+        return false;
+    }
+    ++fills_;
+    return true;
+}
+
+bool ExpertCache::sync_queued(std::string& err) {
+    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) 0);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::sync_queued: ") + cudaGetErrorString(e);
+        return false;
+    }
     return true;
 }
 

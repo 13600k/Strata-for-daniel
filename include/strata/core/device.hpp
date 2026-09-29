@@ -21,7 +21,6 @@ namespace strata::core {
 struct DeviceInfo {
     int ordinal = -1;
     std::string name;
-    std::string uuid;             // stable physical identity for telemetry, independent of ordinal masks
     int cc_major = 0, cc_minor = 0;
     uint64_t total_bytes = 0;      // as reported by cudaMemGetInfo at query time
     uint64_t free_bytes = 0;
@@ -29,23 +28,10 @@ struct DeviceInfo {
     int multi_processor_count = 0;
 };
 
-// CUDA ordinals are relative to CUDA_VISIBLE_DEVICES. Requires compute capability >= 8.0.
-// Querying a device restores the calling thread's previous device.
+// Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
+// run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
+// this is the matching check at run time (a binary can be carried to a different machine).
 DeviceInfo device_info(int ordinal = 0);
-// Launches a tiny compiled kernel to detect missing architecture images before model allocation.
-void device_check_kernels(int ordinal);
-
-// CUDA's current device is THREAD-local. Use around every secondary-device operation
-// and on background threads; destruction restores the previous device, including on errors.
-class DeviceScope {
-public:
-    explicit DeviceScope(int ordinal);
-    ~DeviceScope();
-    DeviceScope(const DeviceScope&) = delete;
-    DeviceScope& operator=(const DeviceScope&) = delete;
-private:
-    int previous_ = -1;
-};
 
 class CudaError : public std::runtime_error {
 public:

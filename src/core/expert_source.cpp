@@ -1,6 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
-#include "strata/core/multi_gpu.hpp"
+#include "strata/core/remote_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "strata/core/pinned.hpp"
@@ -200,6 +200,22 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     const bool use_hits = graph_hits || (d.hits_ready() && d.decided);
     int64_t njobs = 0;
 
+    if (d.remote_count > 0) {
+        int32_t kind[32];
+        if (k > 32) {
+            d.failed = true; d.fail = "remote experts: routing width exceeds 32"; return;
+        }
+        for (int64_t i = 0; i < k; ++i)
+            kind[i] = use_hits && ids[i] >= 0 && ids[i] < d.n_expert && (graph_hits
+                ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] >= 0
+                : d.is_hit[(size_t) i] != 0) ? 0 : -1;
+        static thread_local std::string remote_error;
+        for (int r = 0; r < d.remote_count; ++r)
+            if (!d.remote[r]->begin(d.layers, x_f, ids, 1, k, kind, d.host_res, remote_error)) {
+                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+            }
+    }
+
     for (int64_t i = 0; i < k; ++i) {
         const int64_t e = ids[i];
         if (e < 0 || e >= d.n_expert) {
@@ -232,6 +248,13 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         }
         if (graph_hits) ++d.cache_refused;   // token graph: a miss (nothing is admitted during a token)
 
+        bool remote_owns = false;
+        for (int r = 0; r < d.remote_count; ++r) remote_owns |= d.remote[r]->owns(i);
+        if (remote_owns) {
+            std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
+            continue;
+        }
+
         // `njobs` indexes the JOB ARRAY and `i` indexes the OUTPUT - they are the same only when nothing is a
         // hit, and using one for the other is how a hit's row would get two experts summed into it.
         ExpertJob& j = d.jobs[(size_t) njobs++];
@@ -245,6 +268,13 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     // Plan v0.3 P4: rows of every expert across all threads (bitwise the same as `run`).
     if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
     else d.pool->run(d.jobs.data(), (int) njobs);
+    if (d.remote_count > 0) {
+        static thread_local std::string remote_error;
+        for (int r = 0; r < d.remote_count; ++r)
+            if (!d.remote[r]->finish(out, remote_error)) {
+                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+            }
+    }
     ++d.layers;
     d.experts += k;
 }
@@ -276,25 +306,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
-    // Secondary GPUs are launched before planning/CPU work. Their rows return through
-    // the existing mapped result buffer; the verifier's CPU-completion flag covers
-    // both producers, so the primary graph never sees a half-finished remote result.
+    // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
+    // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    if (k != 10 || n > 128) {
-        d.failed = true; d.fail = "invalid expert window geometry"; return;
-    }
-    uint8_t remote[128] = {};
-    if (d.remote && !d.remote->launch(d.layers, x_f, ids, (int) n_tok, (int) k, remote, d.remote_error)) {
-        d.failed = true; d.fail = d.remote_error.c_str(); d.fail_layer = d.layers; return;
-    }
-    // Drain secondary work even on a later source/validation error. The verifier will
-    // discard this window when dispatch.failed is set; its staging may then be reused.
-    struct RemoteDrain {
-        MultiGpuExperts* tier;
-        ~RemoteDrain() { if (tier) { std::string ignored; tier->finish(nullptr, ignored); } }
-    } remote_drain{d.remote};
-    // ---- primary GPU plan, published FIRST so it starts while the CPU works.
-    int32_t kind[128];                     // per entry: -1 CPU, 0 local VRAM, 1 PCIe, 2 remote GPU
+    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe
     if (d.plan != nullptr && n <= 128 && n <= d.plan->cap) {
         int64_t distinct[128], first_of[128];
         int nd = 0, nmiss = 0;
@@ -305,8 +320,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (first_of[i] == i) {
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
-                if (!remote[i] && e >= 0 && e < d.n_expert &&
-                    d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
+                if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0) ++nmiss;
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
@@ -318,9 +332,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
-            int kd = remote[i0] ? 2 : -1;
+            int kd = -1;
             unsigned long long ptr = 0;
-            if (!remote[i0] && e >= 0 && e < d.n_expert) {
+            if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
                 if (slot >= 0) {
                     kd = 0;
@@ -379,8 +393,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
-            kind[i] = remote[i] ? 2 : (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
+            kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0 : -1;
+        }
+    }
+    if (d.remote_count > 0) {
+        static thread_local std::string remote_error;
+        for (int r = 0; r < d.remote_count; ++r) {
+            if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
+                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+            }
+            for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
         }
     }
     const auto c1 = std::chrono::steady_clock::now();
@@ -405,7 +428,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_expert = e;
                 return;
             }
-            if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
+            if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
@@ -438,10 +461,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("run", njobs);
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    if (d.remote) {
-        const bool ok = d.remote->finish(out, d.remote_error);
-        remote_drain.tier = nullptr;
-        if (!ok) { d.failed = true; d.fail = d.remote_error.c_str(); d.fail_layer = d.layers; return; }
+    if (d.remote_count > 0) {
+        static thread_local std::string remote_error;
+        for (int r = 0; r < d.remote_count; ++r)
+            if (!d.remote[r]->finish(out, remote_error)) {
+                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+            }
     }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
@@ -628,6 +653,8 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     for (auto& t : pool) t.join();
     if (bad) {
         st.seconds = -1.0;
+        st.ok = false;
+        st.error = "short read or unreadable shard while reading the experts from the GGUF";
         return st;
     }
     st.bytes = lay.total;
@@ -638,7 +665,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
-                             std::string& err) {
+                             std::string& err, uint64_t max_pinned_bytes) {
     close();
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
@@ -679,7 +706,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
-    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds);
+    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes);
     if (!a->valid()) {
         delete a;
         err = "ArenaExpertSource: the arena could not be reserved (" + std::to_string(want) + " B)";
@@ -687,6 +714,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
     const LoadStats st = from_gguf ? load_experts_gguf(gguf_, a->data(), lay, threads)
                                    : load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
+    if (!st.ok) {
+        delete a;
+        err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
+        return false;
+    }
     if (st.bytes != want) {
         delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
@@ -715,6 +747,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     reads_ = 0;
     note_ = a->note;
     gib_per_s_ = st.gib_per_second();
+    load_seconds_ = st.seconds;
+    load_read_s_ = st.read_seconds;
+    load_copy_s_ = st.copy_seconds;
     return true;
 }
 

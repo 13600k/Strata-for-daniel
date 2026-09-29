@@ -28,7 +28,7 @@ class _Nvml:
     class Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
-    def __init__(self, index=0, uuid=None):
+    def __init__(self, index=0):
         self.lib = self.dev = None
         names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
                                           "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
@@ -47,14 +47,8 @@ class _Nvml:
                 self.lib = None
                 return
             h = ctypes.c_void_p()
-            if uuid is not None:
-                # CUDA ordinals may be reordered/masked. Never substitute physical
-                # index zero if the selected UUID is unavailable.
-                status = self.lib.nvmlDeviceGetHandleByUUID(uuid.encode("ascii"), ctypes.byref(h))
-            else:
-                get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
-                status = get(ctypes.c_uint(index), ctypes.byref(h))
-            if status != 0:
+            get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
+            if get(ctypes.c_uint(index), ctypes.byref(h)) != 0:
                 self.lib = None
                 return
             self.dev = h
@@ -175,16 +169,19 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, *, gpu_uuids=None):
-        """`extra()` supplies series. UUIDs select GPUs in engine order, primary first; otherwise `gpu_index`
-        selects the card as nvidia-smi/NVML number it (backwards compatible with single-GPU engines)."""
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None):
+        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
+        engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
+        the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
+        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        self.gpu_uuids = list(gpu_uuids or [])
-        self.gpus = [_Nvml(uuid=u) for u in self.gpu_uuids] if self.gpu_uuids else [_Nvml(gpu_index)]
-        self.gpu = self.gpus[0]  # legacy scalar charts describe the actual primary
+        idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
+        self.gpus = [(i, _Nvml(i)) for i in idx]
+        self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
+        self.gpu = self.gpus[0][1]
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -192,10 +189,8 @@ class Telemetry:
             self.ps = None
         self.fallback = _CpuRamFallback()
         self.static = {
-            "gpu_name": self.gpu.name() if self.gpu.ok() else None,
-            "gpus": [{"uuid": self.gpu_uuids[i] if self.gpu_uuids else None,
-                      "name": g.name() if g.ok() else None, "role": "primary" if i == 0 else "experts"}
-                     for i, g in enumerate(self.gpus)],
+            "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
+            "gpu_count": len(self.gpus),
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
@@ -219,12 +214,24 @@ class Telemetry:
         return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
 
     def sample(self):
-        s = {"gpus": []}
-        for i, gpu in enumerate(self.gpus):
-            reading = gpu.read() if gpu.ok() else {}
-            s["gpus"].append(dict(self.static["gpus"][i], **reading))
-            if i == 0:
-                s.update({f"gpu_{k}": v for k, v in reading.items()})
+        s = {}
+        if self.gpu.ok():
+            reads = [(i, g.read()) for i, g in self.gpus]
+            g = dict(reads[0][1])
+            if len(reads) > 1:
+                def vals(k):
+                    return [r[k] for _, r in reads if r.get(k) is not None]
+                for k in ("mem_used", "mem_total", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
+                    v = vals(k)
+                    g[k] = sum(v) if v else None
+                u = vals("util")
+                g["util"] = sum(u) / len(u) if u else None
+                t = vals("temp")
+                g["temp"] = max(t) if t else None
+                s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
+                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+                             for i, r in reads]
+            s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)

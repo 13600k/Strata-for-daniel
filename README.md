@@ -25,15 +25,15 @@ Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
 
 | Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
 | --- | ---: | ---: | ---: |
-| **Q2_0** | 90 tokens/s | 67 tokens/s | 1,310 tokens/s |
-| **IQ2_XS** | 74 tokens/s | 60 tokens/s | 1,240 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 46 tokens/s | 1,110 tokens/s |
-| **IQ3_S** | 52 tokens/s | 41 tokens/s | 1,070 tokens/s |
-| **Coder** (IQ1_M) | 51 tokens/s | 44 tokens/s | 1,300 tokens/s |
+| **Q2_0** | 90 tokens/s | 67 tokens/s | 1,840 tokens/s |
+| **IQ2_XS** | 74 tokens/s | 60 tokens/s | 1,800 tokens/s |
+| **IQ3_XXS** | 62 tokens/s | 46 tokens/s | 1,550 tokens/s |
+| **IQ3_S** | 52 tokens/s | 41 tokens/s | 1,500 tokens/s |
+| **Coder** (IQ1_M) | 51 tokens/s | 44 tokens/s | 1,870 tokens/s |
 
 - **Writes answers** = how fast the reply appears (tokens per second).
 - **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history), measured on a
-  32K-token prompt; a 4K prompt reads at 740-1,000 tokens/s. A 32K prompt takes about 25 seconds with Q2_0.
+  32K-token prompt; a 4K prompt reads at 890-1,520 tokens/s. A 32K prompt takes about 17 seconds with Q2_0.
 
 A card with more VRAM is faster, because more of the model fits on the GPU: an RTX 3090 (24 GB) should do roughly
 100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
@@ -41,6 +41,13 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 
 Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
 (about 5-10 minutes; on the PC above it made the Coder 7% faster).
+
+**Two or three NVIDIA cards?** Just run `START-HERE.bat`: it lists your cards, says which ones Strata can use, and
+asks whether to share the model across them (recommended when two can). An install made on one card asks once at
+its next start. Or choose yourself: `START-HERE.bat --gpus 0,2` (both, remembered), `--gpus all`, or `--gpu 0` (one
+card, this start only). Each card keeps the experts of its own layers, and prompts flow through the cards in a
+pipeline: on an RTX 5080 + RTX 3090 prompts were read 18-20% faster than on the 5080 alone, decoding on par.
+Every card must be an RTX 30 series or newer with 8 GB or more. See [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
 
 ## Which model should I pick?
 
@@ -190,13 +197,6 @@ things you use all the time stay on the counter and the rest waits in the pantry
 
 Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every part and its numbers, and the
 [paper](docs/paper/Strata-Paper.pdf) tells the whole story, with the measurements behind it.
-
-### Experimental multi-GPU experts
-
-Source builds can use additional NVIDIA GPUs as complementary adaptive expert caches, without requiring NVLink or
-peer-to-peer access. The primary GPU still runs attention, context state and batched prompt processing. This path is
-**experimental and not yet hardware-validated**; 4-bit model support and a reduced host-RAM footprint are not included.
-See [multi-GPU setup, limitations and validation](docs/MULTI-GPU.md) before enabling `--devices 0,1`.
 
 ## Credits
 
